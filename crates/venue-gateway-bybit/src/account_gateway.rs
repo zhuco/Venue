@@ -1,7 +1,7 @@
 use std::{collections::BTreeMap, str::FromStr};
 
 use serde::Deserialize;
-use tokio::runtime::{Builder, Runtime};
+use tokio::runtime::Runtime;
 use venue_domain::domain::{
     Amount, Asset, ExecutionCommand, FieldState, Fill, LimitTimeInForce, MarketReduceCommand,
     NativeOrderFamily, OrderCommand, OrderSide, OrderState, PositionSide, Price, Symbol,
@@ -40,7 +40,7 @@ const LIMIT_BBO_MAX_AGE_MS: u64 = 1_000;
 /// Production Bybit adapter for the lightweight account host. It can only POST while consuming
 /// the host's linear permit; callers cannot obtain or clone that permit from this crate.
 pub struct BybitAccountGateway {
-    runtime: Runtime,
+    runtime: &'static Runtime,
     binding: BybitGatewayBinding,
     credentials: BybitCredentials,
     transport: BybitHttpTransport,
@@ -117,10 +117,7 @@ impl BybitAccountGateway {
         transport: BybitHttpTransport,
         generation: u64,
     ) -> Result<Self, BybitAccountGatewayError> {
-        let runtime = Builder::new_current_thread()
-            .enable_io()
-            .enable_time()
-            .build()
+        let runtime = venue_gateway_api::transport_pool::account_runtime()
             .map_err(|_| BybitAccountGatewayError::Runtime)?;
         let (rules, identity, positions) =
             runtime.block_on(bootstrap(&binding, &credentials, &transport, generation, 1))?;

@@ -43,6 +43,7 @@ pub(crate) fn model() -> AppModel {
 pub(crate) fn projection(i: u64) -> TerminalAccountProjection {
     let now = crate::account_center::now_ms();
     TerminalAccountProjection {
+        balance_observed_ms: None,
         schema_version: TERMINAL_PROJECTION_SCHEMA_VERSION,
         credential_id: id(i),
         trading_account_id: id(i + 10),
@@ -118,6 +119,41 @@ fn selection_late_projection_success() {
             projection: Some(projection(1)),
         },
         true,
+    );
+}
+
+#[test]
+fn selection_late_clock_sample_cannot_recalibrate_another_account() {
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.insert(
+        reqwest::header::DATE,
+        reqwest::header::HeaderValue::from_static("Fri, 11 Sep 2026 01:00:00 GMT"),
+    );
+    if let Some(clock) =
+        crate::execution_view::account_clock::AccountClock::from_response(&headers, 100)
+    {
+        late_result(ClientEvent::AccountClock(clock.clone()), false);
+        late_result(ClientEvent::AccountClock(clock), true);
+    } else {
+        assert!(false, "valid clock fixture rejected");
+    }
+}
+
+#[test]
+fn shared_publication_keeps_selection_and_credential_isolation() {
+    let event = ClientEvent::TerminalAccountSharedProjection {
+        credential_id: id(1),
+        projection: Some(std::sync::Arc::new(projection(1))),
+    };
+    late_result(event.clone(), false);
+    late_result(event, true);
+    let model = model();
+    let scope = model.confirmed_account_scope().unwrap();
+    assert!(
+        !scope.accepts(&ClientEvent::TerminalAccountSharedProjection {
+            credential_id: id(1),
+            projection: Some(std::sync::Arc::new(projection(2))),
+        })
     );
 }
 #[test]

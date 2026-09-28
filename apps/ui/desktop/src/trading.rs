@@ -295,9 +295,12 @@ impl HotkeyMapping {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct TradingSettings {
+    pub skip_replace_confirmation: bool,
     pub size_preset_mode: SizePresetMode,
     pub post_only: bool,
     pub price_validity_seconds: u16,
+    /// Local USD amount entry; never an order request or exchange account fact.
+    pub manual_quote_amount: String,
     pub size_presets: [Decimal; SIZE_PRESET_COUNT],
     pub hotkeys: HotkeyMapping,
     pub hotkeys_enabled: bool,
@@ -309,9 +312,11 @@ pub struct TradingSettings {
 impl Default for TradingSettings {
     fn default() -> Self {
         Self {
+            skip_replace_confirmation: false,
             size_preset_mode: SizePresetMode::Amount,
             post_only: true,
             price_validity_seconds: DEFAULT_PRICE_VALIDITY_SECONDS,
+            manual_quote_amount: String::new(),
             size_presets: [
                 Decimal::new(25, 0),
                 Decimal::new(50, 0),
@@ -367,6 +372,19 @@ impl TradingSettings {
             self.price_validity_seconds = DEFAULT_PRICE_VALIDITY_SECONDS;
         }
     }
+
+    pub fn normalize_manual_quote_amount(&mut self) {
+        if self.manual_quote_amount.len() > 40
+            || (!self.manual_quote_amount.is_empty()
+                && self
+                    .manual_quote_amount
+                    .parse::<Decimal>()
+                    .ok()
+                    .is_none_or(|amount| amount <= Decimal::ZERO))
+        {
+            self.manual_quote_amount.clear();
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -397,13 +415,15 @@ pub struct TradeDockState {
 }
 
 impl TradeDockState {
-    pub fn observe_scope(&mut self, symbol: &str, scope: Option<TradingScope>) {
+    pub fn observe_scope(&mut self, symbol: &str, scope: Option<TradingScope>) -> bool {
         // The displayed symbol can change even when both trading scopes are unavailable.
         if self.display_symbol != symbol || self.scope != scope {
             self.clear_selection();
             self.display_symbol = symbol.to_owned();
             self.scope = scope;
+            return true;
         }
+        false
     }
 
     pub fn select_price(&mut self, price: Decimal, now: f64) -> Result<(), TradePlanError> {
@@ -462,6 +482,7 @@ impl TradeDockState {
     pub fn clear_selection(&mut self) {
         self.clear_price();
         self.amount_input.clear();
+        self.amount_in_base = false;
         self.clear_order_selection();
     }
 
@@ -842,6 +863,13 @@ fn order_settings(ui: &mut egui::Ui, model: &mut crate::model::AppModel) {
                 }
             },
         );
+        columns[0].checkbox(
+            &mut model.preferences.trading.skip_replace_confirmation,
+            match language {
+                crate::i18n::Language::SimplifiedChinese => "改价不再二次确认",
+                crate::i18n::Language::English => "Skip price change confirmation",
+            },
+        );
         columns[0].add_space(12.0);
         columns[0].label(
             egui::RichText::new(text(language, TextKey::OrderSettingsHint))
@@ -870,6 +898,7 @@ fn order_settings(ui: &mut egui::Ui, model: &mut crate::model::AppModel) {
         if previous != model.preferences.trading.size_preset_mode {
             model.trade_dock.amount_input.clear();
             model.trade_dock.amount_in_base = false;
+            model.preferences.trading.manual_quote_amount.clear();
             model.trade_dock.armed_action = None;
         }
         for index in 0..SIZE_PRESET_COUNT {

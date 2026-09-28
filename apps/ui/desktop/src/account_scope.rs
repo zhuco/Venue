@@ -26,6 +26,16 @@ impl AccountScope {
 
     pub fn accepts(&self, event: &ClientEvent) -> bool {
         match event {
+            ClientEvent::TerminalAccountSharedProjection {
+                credential_id,
+                projection,
+            } => {
+                credential_id == &self.credential_id
+                    && projection.as_ref().is_none_or(|p| {
+                        p.credential_id == self.credential_id
+                            && p.trading_account_id == self.trading_account_id
+                    })
+            }
             ClientEvent::TerminalAccountProjection {
                 credential_id,
                 projection,
@@ -91,6 +101,21 @@ impl AppModel {
             return false;
         }
         match event {
+            ClientEvent::AccountClock(clock) => self.execution.account_clock = Some(clock),
+            ClientEvent::TerminalAccountSharedProjection {
+                credential_id,
+                projection,
+            } => {
+                if self
+                    .account_overview
+                    .as_ref()
+                    .and_then(|overview| overview.selected_credential_id.as_deref())
+                    == Some(credential_id.as_str())
+                {
+                    self.execution
+                        .apply_private_shared(projection, &mut self.trade_dock);
+                }
+            }
             ClientEvent::TerminalAccountProjection {
                 credential_id,
                 projection,

@@ -28,7 +28,14 @@ async fn fetch_terminal_projection(
     client: &reqwest::Client,
     endpoint: &str,
     request: &TerminalProjectionRequest,
-) -> Result<Option<TerminalAccountProjection>, TerminalReadError> {
+) -> Result<
+    (
+        Option<TerminalAccountProjection>,
+        Option<crate::execution_view::account_clock::AccountClock>,
+    ),
+    TerminalReadError,
+> {
+    let started = std::time::Instant::now();
     let response = client
         .post(path(endpoint, KOL_TERMINAL_ACCOUNT_PATH))
         .json(request)
@@ -44,6 +51,10 @@ async fn fetch_terminal_projection(
             response.status().as_u16()
         )));
     }
+    let clock = crate::execution_view::account_clock::AccountClock::from_response(
+        response.headers(),
+        u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+    );
     let bytes = bounded_body(response).await?;
     let projection: Option<TerminalAccountProjection> = serde_json::from_slice(&bytes)
         .map_err(|_| terminal_unavailable("Private account projection validation failed"))?;
@@ -54,7 +65,7 @@ async fn fetch_terminal_projection(
             "Private account projection validation failed",
         ));
     }
-    Ok(projection)
+    Ok((projection, clock))
 }
 
 async fn fetch_terminal_executions(
@@ -205,7 +216,14 @@ async fn projection_loop(
             if requests.has_changed().unwrap_or(true) {
                 continue;
             }
-            publish(&sender, &context, result);
+            if let Some(clock) = result.0 {
+                publish(
+                    &sender,
+                    &context,
+                    request.scope.event(ClientEvent::AccountClock(clock)),
+                );
+            }
+            publish(&sender, &context, result.1);
         }
         tokio::select! {
             changed = requests.changed() => {
@@ -224,6 +242,33 @@ mod tests {
         time::Duration,
     };
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[tokio::test]
+    async fn account_response_preserves_server_clock_sample()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let endpoint = format!("http://{}", listener.local_addr()?);
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await?;
+            let mut input = [0; 4096];
+            let _ = socket.read(&mut input).await?;
+            socket.write_all(b"HTTP/1.1 200 OK\r\nDate: Fri, 11 Sep 2026 01:00:00 GMT\r\nContent-Length: 4\r\nConnection: close\r\n\r\nnull").await
+        });
+        let request = TerminalProjectionRequest {
+            schema_version: 1,
+            credential_id: crate::account_scope::tests::id(1),
+            symbols: vec!["BTC/USDC".parse()?],
+        };
+        let result = fetch_terminal_projection(
+            &reqwest::Client::builder().no_proxy().build()?,
+            &endpoint,
+            &request,
+        )
+        .await;
+        assert!(matches!(result, Ok((None, Some(_)))));
+        server.await??;
+        Ok(())
+    }
 
     #[tokio::test]
     async fn account_switch_interrupts_slow_read_and_poll_delay()
@@ -309,8 +354,26 @@ mod tests {
             let event =
                 tokio::task::spawn_blocking(move || receiver.recv_timeout(Duration::from_secs(2)))
                     .await??;
-            assert!(matches!(event, ClientEvent::AccountScoped { scope, event }
-                if scope == request(index).scope && matches!(*event, ClientEvent::TerminalAccountProjection { projection: None, .. })));
+            let ClientEvent::AccountScoped { scope, event } = event else {
+                return Err("projection publication must carry its account selection".into());
+            };
+            assert_eq!(scope, request(index).scope);
+            match venue {
+                venue_control_protocol::VenueId::Binance => assert!(matches!(
+                    *event,
+                    ClientEvent::TerminalAccountSharedProjection {
+                        projection: None,
+                        ..
+                    }
+                )),
+                _ => assert!(matches!(
+                    *event,
+                    ClientEvent::TerminalAccountProjection {
+                        projection: None,
+                        ..
+                    }
+                )),
+            }
         }
         drop(requests_tx);
         tokio::time::timeout(Duration::from_secs(1), worker).await??;
@@ -349,17 +412,24 @@ async fn projection_read(
     client: &reqwest::Client,
     endpoint: &str,
     request: &Scoped<TerminalProjectionRequest>,
-) -> ClientEvent {
+) -> (
+    Option<crate::execution_view::account_clock::AccountClock>,
+    ClientEvent,
+) {
     let result = tokio::time::timeout(
         super::REQUEST_TIMEOUT,
         fetch_terminal_projection(client, endpoint, &request.value),
     )
     .await;
+    let mut clock_sample = None;
     let event = match result {
-        Ok(Ok(projection)) => ClientEvent::TerminalAccountProjection {
-            credential_id: request.value.credential_id.clone(),
-            projection,
-        },
+        Ok(Ok((projection, clock))) => {
+            clock_sample = clock;
+            ClientEvent::TerminalAccountProjection {
+                credential_id: request.value.credential_id.clone(),
+                projection,
+            }
+        }
         Ok(Err(TerminalReadError::SessionExpired)) => ClientEvent::SessionExpired,
         Ok(Err(TerminalReadError::Unavailable(message))) => {
             ClientEvent::TerminalAccountUnavailable {
@@ -379,7 +449,7 @@ async fn projection_read(
     {
         crate::latency_evidence::projection_received(&request.scope, p);
     }
-    request.scope.event(event)
+    (clock_sample, request.scope.event(event))
 }
 #[cfg(all(test, not(target_arch = "wasm32")))]
 pub(super) mod race_tests;

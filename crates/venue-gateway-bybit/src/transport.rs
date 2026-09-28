@@ -138,13 +138,13 @@ impl BybitHttpTransport {
         if generation == 0 || endpoint.is_empty() {
             return Err(BybitTransportError::Binding);
         }
-        let mut builder = reqwest::Client::builder()
-            .connect_timeout(limits.operation_timeout)
-            .redirect(reqwest::redirect::Policy::none());
-        if disable_proxy {
-            builder = builder.no_proxy();
-        }
-        let client = builder.build().map_err(|_| BybitTransportError::Http)?;
+        let client = venue_gateway_api::transport_pool::account_http_client(
+            limits.operation_timeout,
+            None,
+            disable_proxy,
+            false,
+        )
+        .map_err(|_| BybitTransportError::Http)?;
         Ok(Self {
             client,
             binding: binding.gateway_binding().clone(),

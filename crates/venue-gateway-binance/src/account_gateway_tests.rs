@@ -314,6 +314,21 @@ fn private_stream_fill_keeps_socket_generation_and_admits_against_current_snapsh
 }
 
 #[test]
+fn funding_balance_only_event_requests_asset_refresh() -> Result<(), Box<dyn std::error::Error>> {
+    let (_, rules, binding) = limit_fixture()?;
+    let event = normalize_private_stream_event(BinanceRawPrivateFrame {
+        binding: binding.clone(), instrument_generation: rules.instrument.generation,
+        private_generation: 9, received_at_ms: 1_720_000_000_100,
+        payload: Bytes::from_static(br#"{"e":"ACCOUNT_UPDATE","fs":"UM","E":1000,"T":999,"a":{"m":"FUNDING_FEE","B":[{"a":"USDT","wb":"100","cw":"100","bc":"-1"}]}}"#),
+    }, &binding, rules.instrument.generation, 9, 10)?;
+    assert!(matches!(
+        event,
+        Some(BinancePrivateAccountEvent::RefreshRecommended)
+    ));
+    Ok(())
+}
+
+#[test]
 fn private_stream_admits_each_enabled_kol_symbol_without_retaining_the_frame()
 -> Result<(), Box<dyn std::error::Error>> {
     let (_, rules, binding) = limit_fixture()?;
@@ -767,4 +782,27 @@ fn signed_snapshot_fills_cursor_keeps_symbol_watermarks_and_rejects_sha_legacy()
         ))
         .is_err()
     );
+}
+
+#[test]
+fn from_id_replay_keeps_unseen_fills_before_the_previous_observation()
+-> Result<(), Box<dyn std::error::Error>> {
+    let mut cursor = RecentFillsCursor {
+        observed_through_ms: 20,
+        last_trade_id: Some(7),
+        last_event_time_ms: Some(11),
+    };
+    let late = json_rows_snapshot(br#"[{"id":"8","time":"12"},{"id":"9","time":"13"}]"#)?;
+    advance_snapshot_fill_cursor(&mut cursor, &late, 20)?;
+    assert_eq!(cursor.last_trade_id, Some(9));
+    assert_eq!(cursor.last_event_time_ms, Some(13));
+    let backwards = json_rows_snapshot(br#"[{"id":"10","time":"12"}]"#)?;
+    assert!(advance_snapshot_fill_cursor(&mut cursor, &backwards, 20).is_err());
+    let mut first = RecentFillsCursor {
+        observed_through_ms: 20,
+        last_trade_id: None,
+        last_event_time_ms: None,
+    };
+    assert!(advance_snapshot_fill_cursor(&mut first, &late, 20).is_err());
+    Ok(())
 }

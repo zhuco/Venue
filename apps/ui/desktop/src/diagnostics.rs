@@ -103,19 +103,52 @@ pub fn init_diagnostics() {
         .with_target(false)
         .with_ansi(false)
         .with_writer(writer)
-        .with_filter(
-            tracing_subscriber::filter::Targets::new()
-                .with_default(tracing::Level::WARN)
-                .with_target("venueflow::terminal_latency", tracing::Level::INFO)
-                .with_target("venueflow::account_projection", tracing::Level::INFO)
-                .with_target("venueflow::chart_loading", tracing::Level::INFO),
-        );
+        .with_filter(diagnostic_targets());
     let _ = tracing_subscriber::registry().with(layer).try_init();
+}
+
+fn diagnostic_targets() -> tracing_subscriber::filter::Targets {
+    tracing_subscriber::filter::Targets::new()
+        .with_default(tracing::Level::WARN)
+        .with_target("venueflow::terminal_latency", tracing::Level::INFO)
+        .with_target("venueflow::account_projection", tracing::Level::INFO)
+        .with_target("venueflow::chart_loading", tracing::Level::INFO)
+        .with_target("venueflow::frame_performance", tracing::Level::INFO)
+        .with_target("venueflow::indicator_performance", tracing::Level::INFO)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn frame_performance_info_reaches_desktop_diagnostics() -> io::Result<()> {
+        use std::sync::{Arc, Mutex};
+        struct Capture(Arc<Mutex<Vec<u8>>>);
+        impl Write for Capture {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                self.0.lock().map_err(|_| io::Error::other("capture poisoned"))?.extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> io::Result<()> { Ok(()) }
+        }
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        let captured = bytes.clone();
+        let layer = tracing_subscriber::fmt::layer()
+            .with_writer(BoxMakeWriter::new(move || Capture(captured.clone())))
+            .with_filter(diagnostic_targets());
+        let subscriber = tracing_subscriber::registry().with(layer);
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info!(target: "venueflow::frame_performance", "frame-sample-probe");
+            tracing::info!(target: "venueflow::indicator_performance", "indicator-sample-probe");
+            tracing::info!(target: "venueflow::unrelated", "filtered-probe");
+        });
+        let output = String::from_utf8(bytes.lock().map_err(|_| io::Error::other("capture poisoned"))?.clone())
+            .map_err(io::Error::other)?;
+        assert!(output.contains("frame-sample-probe"));
+        assert!(output.contains("indicator-sample-probe"));
+        assert!(!output.contains("filtered-probe"));
+        Ok(())
+    }
     #[test]
     fn saturated_log_queue_drops_bounded_records_without_waiting() -> io::Result<()> {
         let (sender, receiver) = sync_channel(1);

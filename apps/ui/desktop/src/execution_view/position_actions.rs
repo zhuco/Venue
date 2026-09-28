@@ -336,6 +336,7 @@ mod tests {
             mark_price: Some(Decimal::ONE),
         };
         let mut projection = TerminalAccountProjection {
+            balance_observed_ms: None,
             schema_version: TERMINAL_PROJECTION_SCHEMA_VERSION,
             credential_id: credential,
             trading_account_id: account,

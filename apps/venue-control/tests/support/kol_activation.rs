@@ -48,13 +48,6 @@ async fn activation_checks_actual_exposure_identity_and_retires_previous_targets
         .ok_or("no activation")?;
     let leader = baseline(&id(502), 51, 30, Decimal::ONE)?;
     let flat = baseline(&account, 52, 30, Decimal::ZERO)?;
-    let exposed = baseline(&account, 52, 30, Decimal::new(1, 3))?;
-    assert!(
-        store
-            .complete_activation(&activation, &leader, &exposed, 31)
-            .await
-            .is_err()
-    );
     let mut other_symbol = flat.clone();
     other_symbol.snapshot = SignedAccountSnapshot::complete(
         flat.snapshot.binding().clone(),
@@ -74,12 +67,6 @@ async fn activation_checks_actual_exposure_identity_and_retires_previous_targets
         "cursor".into(),
         Vec::new(),
     )?;
-    assert!(
-        store
-            .complete_activation(&activation, &leader, &other_symbol, 31)
-            .await
-            .is_err()
-    );
     for family in [
         venue_domain::domain::NativeOrderFamily::UmOrder,
         venue_domain::domain::NativeOrderFamily::UmAlgo,
@@ -120,6 +107,27 @@ async fn activation_checks_actual_exposure_identity_and_retires_previous_targets
                 .is_err()
         );
     }
+    let mut conditional = other_symbol.clone();
+    conditional.snapshot = conditional.snapshot.with_conditional_orders(vec![
+        venue_execution::SignedConditionalOrderFact {
+            client_order_id: "existing-stop".into(),
+            venue_order_id: "10".into(),
+            symbol: "ETH/USDT".parse()?,
+            side: OrderSide::Buy,
+            position_side: PositionSide::Short,
+            quantity: Decimal::ONE,
+            trigger_price: Decimal::from(2100),
+            working_type: "MARK_PRICE".into(),
+            reduce_only: false,
+            created_at_ms: Some(1),
+        },
+    ])?;
+    assert!(
+        store
+            .complete_activation(&activation, &leader, &conditional, 31)
+            .await
+            .is_err()
+    );
     let wrong_identity = baseline(&account, 99, 30, Decimal::ZERO)?;
     assert!(
         store
@@ -171,8 +179,8 @@ async fn activation_checks_actual_exposure_identity_and_retires_previous_targets
         .bind(id(597))
         .execute(&fixture.pool)
         .await?;
-    // A nonzero KOL baseline is allowed and is not copied. Only the flat follower starts anew.
-    // A peer strategy instance is not account ownership; the flat baseline and pending-command
+    // A nonzero KOL baseline is allowed and is not copied. Existing follower positions are retained without catch-up.
+    // A peer strategy instance is not account ownership; the signed baseline and pending-command
     // fences above remain authoritative even though Grid allocation itself does not block KOL.
     inventory_mm::start_peer_grid(
         &fixture.pool,
@@ -184,7 +192,7 @@ async fn activation_checks_actual_exposure_identity_and_retires_previous_targets
     )
     .await?;
     store
-        .complete_activation(&activation, &leader, &flat, 32)
+        .complete_activation(&activation, &leader, &other_symbol, 32)
         .await?;
     let target: (String, String, String, i64, bool) = sqlx::query_as("SELECT copyable_quantity,target_quantity,observed_quantity,target_revision,dirty FROM venue_kol_copy_targets WHERE relation_id=$1")
         .bind(&relation).fetch_one(&fixture.pool).await?;
@@ -199,6 +207,10 @@ async fn activation_checks_actual_exposure_identity_and_retires_previous_targets
     .await?;
     assert_eq!(persisted["target_model"], 2);
     assert_eq!(persisted["baseline_ms"], 32);
+    assert_eq!(
+        persisted["follower_positions"],
+        serde_json::to_value(other_symbol.snapshot.positions())?
+    );
     assert!(
         persisted["leader_positions"]
             .as_array()

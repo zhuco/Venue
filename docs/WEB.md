@@ -27,6 +27,12 @@ Both BFFs require `VENUE_CONTROL_ORIGIN` and a deployment `VENUE_WEB_SESSION_SIG
 
 The browser holds only a short-lived Secure/HttpOnly/SameSite session. BFF reads filter account scope; mutations also require CSRF, exact Origin/Host, role and binding validation. No exchange credential or direct Control connection reaches the browser. Interrupted mutation responses retain the original request ID and are not automatically retried. Missing/stale snapshots, invalid events, connection loss and session expiry close writes. A control receipt is never displayed as a fill.
 
+## Standalone 打包与发布
+
+在 `apps/ui/web` 执行 `bash scripts/build.sh` 可将 standalone 与静态资源复制到 `dist/`，并生成包内 `DEPLOY.md`；npm 直接构建的入口仍为 `.next/standalone/server.js`。上传完整产物到新的版本目录，通过进程环境或服务的 EnvironmentFile 注入本页配置，使用 `node server.js` 启动；不要假定手动创建的 `.env` 会自动加载。
+
+服务监听回环地址，由 HTTPS 反向代理提供公共入口，并保留正确的 Host 与配置一致的 `VENUE_WEB_PUBLIC_ORIGIN`。发布后核对静态资源、登录、CSRF 写入、会话失效和 SSE；回滚切换至保留的旧版本目录。生成模板不替代本页 HTTPS、会话密钥与精确路由要求。
+
 ## Desktop HTTPS access
 
 Desktop access shares `https://clawdbotweb.site` but uses its own Control Bearer session, not BFF cookies. `scripts/configure_desktop_https.py` adds only the desktop client's exact HTTP methods/paths beneath the existing `venue-kol-web` Caddy route, including the support-martingale and Binance inventory-market-maker instance, preflight and lifecycle endpoints; all other traffic retains the Web fallback. It also exposes exactly three read-only Binance USD-M REST paths and two combined public WebSocket paths so installed clients do not require direct Binance reachability; authorization and cookie headers are removed before those requests reach Binance. The proxy disables response buffering for SSE/streams and sets `Cache-Control: no-store`. Node/internal routes are excluded; Control still binds only to loopback and performs authentication/ownership checks.
@@ -49,7 +55,7 @@ KOL 后台“邀请跟单用户”提供随机生成、自定义、查看和复�
 
 KOL 与跟单页面必须使用币安统一账户（Portfolio Margin）及 U 本位双向持仓。`/v2/kol/source` 保存 KOL 唯一带单账户，不使用会话当前账户代替。管理员可预建无账户的 draft KOL；首次选择本人已验证账户时以权益初始化策略资金并占用全站 5 个 KOL 名额之一，不自动启动带单。已有机器人或跟单关系时禁止换源，保留历史归属。需迁移 0047。
 
-KOL 原生跟单的新指令不再使用软件单笔或总名义金额上限，也不再以初始权益乘 5 限制开仓。限价、市价与 STOP_MARKET 开仓均持久化 `copy_risk.notional_limit_policy=exchange_account`；币安账户保证金、持仓/订单规则、交易所步长/最小名义额/最大数量决定准入，原权限、同一身份对账、价格保护和只减仓约束保留。定比/定额决定计划数量，定比权益仍是验证快照，取消额度不代表动态重算跟单比例。历史无此字段的指令按 `stored_limits` 原规则恢复，已拒绝指令不自动补发。旧 wire 和数据库额度列仅为历史兼容，新模式不用于开仓额度；页面移除额度输入，API 字段显示统一为“API密钥”和“密钥”。
+新旧 KOL 命令的额度、最小数量与恢复策略统一见 [订单同步额度策略](LEADER_ORDER_MIRROR.md#额度策略)。页面移除软件额度输入，API 字段统一显示“API密钥”和“密钥”。
 
 手工创建的 KOL 无需额外带单审批：验证币安 API 并指定唯一带单账户时自动授予初始带单权限；已有明确撤权不自动恢复。普通跟单注册不授予 KOL 身份。验证按钮必须展示验证结果，HTTP 200 不代表验证通过；空账户编号不得显示为已指定带单账户。
 

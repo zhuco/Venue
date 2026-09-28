@@ -1,3 +1,5 @@
+mod adoption;
+mod deletion;
 use super::{AccountError, AccountService, Principal, crypto, database_error, error, ms};
 use secrecy::SecretString;
 use sqlx::Row;
@@ -200,15 +202,30 @@ impl AccountService {
         match result {
             Ok(probe) => {
                 let new_account_id = crypto::opaque_id()?;
-                sqlx::query("INSERT INTO venue_user_trading_accounts (trading_account_id,user_id,venue,exchange_identity_hash) VALUES ($1,$2,'binance',$3) ON CONFLICT (venue,exchange_identity_hash) DO NOTHING")
+                sqlx::query("INSERT INTO venue_user_trading_accounts (trading_account_id,user_id,venue,exchange_identity_hash) VALUES ($1,$2,'binance',$3) ON CONFLICT (venue,exchange_identity_hash) WHERE retired_ms IS NULL DO NOTHING")
                     .bind(&new_account_id).bind(&principal.user.user_id).bind(probe.account_identity_hash.as_slice())
                     .execute(&mut *tx).await.map_err(database_error)?;
-                let account = sqlx::query("SELECT trading_account_id,user_id FROM venue_user_trading_accounts WHERE venue='binance' AND exchange_identity_hash=$1")
+                let account = sqlx::query("SELECT trading_account_id,user_id FROM venue_user_trading_accounts WHERE venue='binance' AND exchange_identity_hash=$1 AND retired_ms IS NULL FOR UPDATE")
                     .bind(probe.account_identity_hash.as_slice()).fetch_one(&mut *tx).await.map_err(database_error)?;
-                let owner: String = account.try_get("user_id").map_err(database_error)?;
-                let account_id: String = account
+                let mut owner: String = account.try_get("user_id").map_err(database_error)?;
+                let mut account_id: String = account
                     .try_get("trading_account_id")
                     .map_err(database_error)?;
+                if owner != principal.user.user_id && summary.trading_account_id.is_none() {
+                    if let Some(adopted) = adoption::adopt_deleted_personal(
+                        &mut tx,
+                        principal,
+                        id,
+                        &account_id,
+                        &owner,
+                        &probe,
+                    )
+                    .await?
+                    {
+                        account_id = adopted;
+                        owner = principal.user.user_id.clone();
+                    }
+                }
                 if owner != principal.user.user_id
                     || summary
                         .trading_account_id
@@ -318,9 +335,25 @@ impl AccountService {
             }
         }
         let mut tx = self.pool.begin().await.map_err(database_error)?;
+        if let Some(account_id) = &initial.trading_account_id {
+            let depth = crate::executor_store::lock_account_command_queue(
+                &mut tx,
+                &principal.user.user_id,
+                account_id,
+                &id,
+            )
+            .await
+            .map_err(|_| error(Code::Unavailable))?;
+            if depth != 0 {
+                return Err(error(Code::AccountInUse));
+            }
+        }
         let row = sqlx::query("SELECT verification_json FROM venue_api_credentials WHERE credential_id=$1 AND user_id=$2 AND deleted_ms IS NULL FOR UPDATE")
             .bind(&id).bind(&principal.user.user_id).fetch_optional(&mut *tx).await.map_err(database_error)?.ok_or(error(Code::NotFound))?;
         let summary = decode_summary(row.try_get("verification_json").map_err(database_error)?)?;
+        if initial.trading_account_id != summary.trading_account_id {
+            return Err(error(Code::Conflict));
+        }
         if let Some(account_id) = &summary.trading_account_id {
             // All keys for one real account share this deletion/command barrier.
             // Locking only the removed key would race with another key's commands.
@@ -334,42 +367,51 @@ impl AccountService {
             if !summary.selectable(checked_now) || summary.has_exposure != Some(false) {
                 return Err(error(Code::AccountInUse));
             }
-            let snapshot: Option<serde_json::Value> = sqlx::query_scalar(
+            deletion::check_current_custody(&mut tx, account_id, summary.verified_ms).await?;
+            // Released legacy snapshots are audit facts, not shared-executor custody.
+            let executor_owned: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM venue_binance_grid_instances WHERE trading_account_id=$1) OR EXISTS(SELECT 1 FROM venue_binance_commands WHERE trading_account_id=$1)")
+                .bind(account_id).fetch_one(&mut *tx).await.map_err(database_error)?;
+            if !executor_owned {
+                let snapshot: Option<serde_json::Value> = sqlx::query_scalar(
                 "SELECT snapshot_json FROM venue_control_snapshots WHERE singleton=TRUE FOR SHARE",
             )
             .fetch_optional(&mut *tx)
             .await
             .map_err(database_error)?;
-            if let Some(value) = snapshot {
-                let snapshot: ControlSnapshot =
-                    serde_json::from_value(value).map_err(|_| error(Code::Unavailable))?;
-                snapshot.validate().map_err(|_| error(Code::Unavailable))?;
-                if snapshot.accounts.iter().any(|a| {
-                    &a.trading_account_id == account_id && a.health != HealthState::Stopped
-                }) || snapshot.strategies.iter().any(|s| {
-                    &s.trading_account_id == account_id
-                        && (s.lifecycle != StrategyLifecycle::Stopped
-                            || s.open_orders != 0
-                            || !s.long_quantity.is_zero()
-                            || !s.short_quantity.is_zero())
-                }) {
+                if let Some(value) = snapshot {
+                    let snapshot: ControlSnapshot =
+                        serde_json::from_value(value).map_err(|_| error(Code::Unavailable))?;
+                    snapshot.validate().map_err(|_| error(Code::Unavailable))?;
+                    if snapshot.accounts.iter().any(|a| {
+                        &a.trading_account_id == account_id && a.health != HealthState::Stopped
+                    }) || snapshot.strategies.iter().any(|s| {
+                        &s.trading_account_id == account_id
+                            && (s.lifecycle != StrategyLifecycle::Stopped
+                                || s.open_orders != 0
+                                || !s.long_quantity.is_zero()
+                                || !s.short_quantity.is_zero())
+                    }) {
+                        return Err(error(Code::AccountInUse));
+                    }
+                }
+                let pending: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM venue_control_command_inbox WHERE command_json->>'trading_account_id'=$1 AND receipt_json->>'state' IN ('accepted','unknown'))")
+                .bind(account_id).fetch_one(&mut *tx).await.map_err(database_error)?;
+                if pending {
                     return Err(error(Code::AccountInUse));
                 }
-            }
-            let pending: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM venue_control_command_inbox WHERE command_json->>'trading_account_id'=$1 AND receipt_json->>'state' IN ('accepted','unknown'))")
-                .bind(account_id).fetch_one(&mut *tx).await.map_err(database_error)?;
-            if pending {
-                return Err(error(Code::AccountInUse));
             }
         }
         sqlx::query("UPDATE venue_user_sessions SET selected_credential_id=NULL WHERE selected_credential_id=$1").bind(&id)
             .execute(&mut *tx).await.map_err(database_error)?;
-        // Remove encrypted material, while the independent account identity remains stable.
-        sqlx::query("DELETE FROM venue_api_credentials WHERE credential_id=$1")
-            .bind(&id)
-            .execute(&mut *tx)
-            .await
-            .map_err(database_error)?;
+        let mut tombstone = summary;
+        invalidate(&mut tombstone, State::Unverified);
+        tombstone.masked_key = "已删除".into();
+        // Retain foreign-key identity for historical orders; erase only key material.
+        sqlx::query("UPDATE venue_api_credentials SET encrypted_credentials=$1,key_fingerprint=$2,masked_key=$3,verification_json=$4,deleted_ms=$5,revision=revision+1 WHERE credential_id=$6")
+            .bind(Vec::<u8>::new())
+            .bind(crypto::fingerprint(format!("credential-deleted:{id}:{now_ms}").as_bytes()))
+            .bind(&tombstone.masked_key).bind(encode_summary(&tombstone)?)
+            .bind(ms(now_ms)?).bind(&id).execute(&mut *tx).await.map_err(database_error)?;
         tx.commit().await.map_err(database_error)?;
         Ok(())
     }

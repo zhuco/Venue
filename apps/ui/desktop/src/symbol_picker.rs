@@ -99,7 +99,7 @@ pub(crate) fn show(
                         if model.preferences.market_server
                             == crate::model::MarketServer::Hyperliquid
                         {
-                            "标记价 / Mark"
+                            "最新 / 标记价"
                         } else {
                             text(language, TextKey::Last)
                         },
@@ -197,18 +197,23 @@ pub(crate) fn show(
                                                 },
                                             )),
                                         );
+                                        let latest = model
+                                            .market_prices(symbol, crate::market_prices::now_ms())
+                                            .reference_price();
+                                        ui.add_sized(
+                                            [130.0, 28.0],
+                                            egui::Label::new(
+                                                RichText::new(
+                                                    latest
+                                                        .map(|price| {
+                                                            model.format_market_price(symbol, price)
+                                                        })
+                                                        .unwrap_or_else(|| "—".into()),
+                                                )
+                                                .monospace(),
+                                            ),
+                                        );
                                         if let Some(quote) = local_quote(model, symbol) {
-                                            ui.add_sized(
-                                                [130.0, 28.0],
-                                                egui::Label::new(
-                                                    RichText::new(
-                                                        model.format_market_price(
-                                                            symbol, quote.last,
-                                                        ),
-                                                    )
-                                                    .monospace(),
-                                                ),
-                                            );
                                             let change_color = if quote.change_percent_24h
                                                 >= rust_decimal::Decimal::ZERO
                                             {
@@ -240,7 +245,7 @@ pub(crate) fn show(
                                                 ),
                                             );
                                         } else {
-                                            for width in [130.0, 100.0, 170.0] {
+                                            for width in [100.0, 170.0] {
                                                 ui.add_sized([width, 28.0], egui::Label::new("—"));
                                             }
                                         }

@@ -2,6 +2,7 @@
 //! socket. It is deliberately not a recovery journal: restart and gaps require a new bootstrap.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::time::{Duration, Instant};
 
 use rust_decimal::Decimal;
 use serde_json::Value;
@@ -25,6 +26,8 @@ pub(super) struct AccountStreamProjection {
     event_times: BTreeMap<String, u64>,
     last_published_ms: u64,
     last_change_received_ms: u64,
+    incomplete_since: Option<Instant>,
+    balances: Option<(Vec<venue_execution::SignedAccountBalance>, u64)>,
 }
 
 impl AccountStreamProjection {
@@ -59,7 +62,9 @@ impl AccountStreamProjection {
             event_times: BTreeMap::new(),
             last_published_ms: baseline.observed_at_ms(),
             last_change_received_ms: baseline.observed_at_ms(),
+            incomplete_since: None,
             baseline,
+            balances: None,
         }
     }
 
@@ -71,8 +76,7 @@ impl AccountStreamProjection {
         let value: Value = serde_json::from_slice(&frame.payload).map_err(|_| invalid())?;
         let event = text(&value, "e")?;
         if matches!(event, "balanceUpdate" | "outboundAccountPosition") {
-            // These change the cached PM equity, not UM orders or positions. Equity remains
-            // explicitly timestamped at bootstrap and is verified before profit reduction.
+            // The consumer refreshes PM equity independently; this frame carries no total USD equity.
             number(&value, "E")?;
             return Ok(());
         }
@@ -300,15 +304,22 @@ impl AccountStreamProjection {
     }
 
     fn snapshot(
-        &self,
+        &mut self,
         observed_ms: u64,
         private_generation: u64,
     ) -> Result<Option<SignedAccountSnapshot>, BinanceAccountGatewayError> {
-        let incomplete = self.trade_times.iter().any(|(key, time)| {
-            self.position_times
-                .get(key)
-                .is_none_or(|position| position < time)
-        }) || self.expected_quantities.iter().any(|(key, expected)| {
+        self.snapshot_at(observed_ms, private_generation, Instant::now())
+    }
+
+    fn snapshot_at(
+        &mut self,
+        observed_ms: u64,
+        private_generation: u64,
+        now: Instant,
+    ) -> Result<Option<SignedAccountSnapshot>, BinanceAccountGatewayError> {
+        // Inventory is the continuity proof. A later fill clock must not freeze publication
+        // when ACCOUNT_UPDATE already reports the same quantity with an earlier T.
+        let incomplete = self.expected_quantities.iter().any(|(key, expected)| {
             self.positions.get(key).map(|position| position.quantity) != Some(*expected)
         }) || self.positions.iter().any(|(key, position)| {
             self.expected_quantities
@@ -317,14 +328,20 @@ impl AccountStreamProjection {
                 .unwrap_or(Decimal::ZERO)
                 != position.quantity
         });
-        if incomplete && observed_ms.saturating_sub(self.last_change_received_ms) > 5_000 {
-            eprintln!(
-                "Authenticated position quantities or trade coverage did not converge: trade_times={:?} position_times={:?}",
-                self.trade_times, self.position_times
-            );
-            return Err(invalid());
+        if incomplete {
+            // The recovery deadline must progress even when the socket receives no new facts.
+            let started = *self.incomplete_since.get_or_insert(now);
+            if now.saturating_duration_since(started) >= Duration::from_secs(5) {
+                eprintln!(
+                    "Authenticated position quantities or trade coverage did not converge: trade_times={:?} position_times={:?}",
+                    self.trade_times, self.position_times
+                );
+                return Err(invalid());
+            }
+            return Ok(None);
         }
-        if observed_ms <= self.last_published_ms || incomplete {
+        self.incomplete_since = None;
+        if observed_ms <= self.last_published_ms {
             return Ok(None);
         }
         let mut cursor = super::parse_snapshot_fills_cursor(Some(self.baseline.fills_cursor()))
@@ -359,7 +376,20 @@ impl AccountStreamProjection {
             cursor.encode(),
             Vec::new(),
         )
-        .and_then(|snapshot| snapshot.with_balances(self.baseline.balances().to_vec()))
+        .and_then(|snapshot| {
+            let (balances, time) = self
+                .balances
+                .as_ref()
+                .filter(|(_, time)| *time <= observed_ms)
+                .map(|(balances, time)| (balances.clone(), *time))
+                .unwrap_or_else(|| {
+                    (
+                        self.baseline.balances().to_vec(),
+                        self.baseline.balance_observed_at_ms(),
+                    )
+                });
+            snapshot.with_balances_at(balances, time)
+        })
         .and_then(|snapshot| snapshot.with_stream_origin(self.baseline.observed_at_ms()))
         .map_err(|_| invalid())?;
         Ok(Some(snapshot))
@@ -367,6 +397,27 @@ impl AccountStreamProjection {
 }
 
 impl BinanceAccountGateway {
+    pub fn accept_balance_read(
+        &mut self,
+        balances: Vec<venue_execution::SignedAccountBalance>,
+        observed: u64,
+        generation: u64,
+    ) {
+        if generation != self.private_generation {
+            return;
+        }
+        if let Some(state) = &mut self.stream_projection {
+            if observed > state.baseline.balance_observed_at_ms()
+                && state
+                    .balances
+                    .as_ref()
+                    .is_none_or(|(_, time)| observed > *time)
+            {
+                state.balances = Some((balances, observed));
+                state.last_change_received_ms = state.last_change_received_ms.max(observed);
+            }
+        }
+    }
     pub fn install_stream_projection(
         &mut self,
         snapshot: SignedAccountSnapshot,
@@ -382,7 +433,7 @@ impl BinanceAccountGateway {
     }
 
     /// No HTTP. The observation time is the latest real frame/Pong, never the local poll time.
-    /// Balances retain the bootstrap value; callers must independently verify PM equity before
+    /// Balances retain their independent signed observation time; verify PM equity before
     /// using it for a new risk action. The snapshot is a read model, not a dispatch permission.
     /// A scheduling hint only; callers still validate the complete signed projection.
     pub fn stream_projection_change_ms(&self) -> Option<u64> {
@@ -394,13 +445,14 @@ impl BinanceAccountGateway {
     pub fn stream_projection_snapshot(
         &mut self,
     ) -> Result<Option<SignedAccountSnapshot>, BinanceAccountGatewayError> {
-        let Some(state) = &self.stream_projection else {
+        let (observed, generation) = match &self.private_stream {
+            Some(stream) => (stream.last_received_at_ms(), self.private_generation),
+            None => return Ok(None),
+        };
+        let Some(state) = &mut self.stream_projection else {
             return Ok(None);
         };
-        let Some(stream) = &self.private_stream else {
-            return Ok(None);
-        };
-        let snapshot = state.snapshot(stream.last_received_at_ms(), self.private_generation)?;
+        let snapshot = state.snapshot(observed, generation)?;
         if let Some(snapshot) = &snapshot {
             for symbol in snapshot
                 .open_orders()

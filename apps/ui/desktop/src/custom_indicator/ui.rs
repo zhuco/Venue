@@ -9,12 +9,11 @@ use rust_decimal::Decimal;
 pub(crate) fn settings_ui(ui: &mut egui::Ui, settings: &mut CustomSettings, language: Language) {
     egui::ScrollArea::vertical()
         .id_salt("custom-indicator-settings")
-        .max_height(405.0)
+        .max_height(250.0)
         .show(ui, |ui| {
             ui.set_min_height(395.0);
             ui.horizontal(|ui| {
                 ui.heading(text(language, Key::Title));
-                ui.checkbox(&mut settings.enabled, text(language, Key::Enabled));
             });
             ui.label(
                 RichText::new(text(language, Key::Implementation)).color(theme::TEXT_SECONDARY),

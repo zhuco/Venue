@@ -6,8 +6,9 @@ use std::{
 use rust_decimal::Decimal;
 use serde_json::{Map, Value};
 use venue_domain::domain::{
-    AggressorSide, FieldState, MarketDelta, MarketLevel, MarketSnapshot, Price, PublicBar,
-    PublicTicker, PublicTrade, Symbol,
+    AggressorSide, FieldState, MarkFunding, MarketDelta, MarketLevel, MarketSnapshot,
+    OpenInterestSample, OpenInterestUnit, Price, PublicBar, PublicTicker, PublicTrade, Symbol,
+    UnknownReason,
 };
 use venue_gateway_api::{GatewayBinding, PublicMarketBinding};
 
@@ -848,6 +849,121 @@ pub fn parse_public_market_kline(
     }
 }
 
+/// Normalizes the public USD-M mark-price stream without using account credentials.
+pub fn parse_public_mark_funding(
+    payload: &str,
+    binding: &PublicMarketBinding,
+    generation: u64,
+    received_at_ms: u64,
+) -> Result<BinancePublicEnvelope<MarkFunding>, BinancePublicError> {
+    let (object, expected_native) =
+        public_market_stream_object(payload, binding, generation, "markPriceUpdate")?;
+    if object.get("st").and_then(Value::as_u64).is_some_and(|kind| kind != 1) {
+        return Err(BinancePublicError::Binding);
+    }
+    let exchange_event_time_ms = positive_u64(object.get("E"))?;
+    if received_at_ms < exchange_event_time_ms || received_at_ms == 0 {
+        return Err(BinancePublicError::Sequence);
+    }
+    let mark_price = positive_price(object.get("p"))?;
+    let index_price = positive_price(object.get("i"))?;
+    let funding_rate = decimal(object.get("r"))?;
+    let next_funding_time_ms = positive_u64(object.get("T"))?;
+    let estimated_settle_price = match object.get("P") {
+        Some(value) if value.as_str() != Some("") && value.as_str() != Some("0") => {
+            FieldState::Known(positive_price(Some(value))?)
+        }
+        _ => FieldState::NotApplicable,
+    };
+    Ok(envelope(
+        payload,
+        expected_native,
+        generation,
+        exchange_event_time_ms,
+        None,
+        MarkFunding {
+            symbol: binding.symbol.clone(),
+            generation,
+            received_at_ms,
+            exchange_time_ms: exchange_event_time_ms,
+            time_source: venue_domain::MarketTimeSource::Exchange,
+            next_funding_time_ms: Some(next_funding_time_ms),
+            mark_price: FieldState::Known(mark_price),
+            index_price: FieldState::Known(index_price),
+            funding_rate,
+            estimated_settle_price,
+            predicted_funding_rate: FieldState::NotApplicable,
+            unknown_reason: None,
+        },
+    ))
+}
+
+/// Parses the exact USD-M contract's current open interest. Quantity is base-asset units.
+pub fn parse_public_open_interest_current(
+    payload: &str,
+    binding: &PublicMarketBinding,
+    generation: u64,
+    received_at_ms: u64,
+) -> Result<OpenInterestSample, BinancePublicError> {
+    binding.validate().map_err(|_| BinancePublicError::Binding)?;
+    if generation == 0 || received_at_ms == 0 { return Err(BinancePublicError::Generation) }
+    let value: Value = serde_json::from_str(payload).map_err(|_| BinancePublicError::Payload)?;
+    let object = value.as_object().ok_or(BinancePublicError::Payload)?;
+    check_symbol(object.get("symbol"), &native_symbol(&binding.symbol))?;
+    let quantity = non_negative_decimal(object.get("openInterest"))?;
+    let sample = OpenInterestSample {
+        symbol: binding.symbol.clone(), generation, received_at_ms,
+        exchange_time_ms: positive_u64(object.get("time"))?,
+        time_source: venue_domain::MarketTimeSource::Exchange,
+        sampling_interval_ms: None,
+        native_quantity: quantity,
+        native_unit: OpenInterestUnit::BaseAsset,
+        base_quantity: FieldState::Known(quantity),
+        quote_notional: FieldState::Unavailable { reason: UnknownReason::SourceOmitted },
+        quote_asset: None,
+    };
+    if !sample.is_valid() { return Err(BinancePublicError::Value) }
+    Ok(sample)
+}
+
+/// Parses real five-minute historical samples. Timestamps are end-of-period observations.
+pub fn parse_public_open_interest_history(
+    payload: &str,
+    binding: &PublicMarketBinding,
+    generation: u64,
+    received_at_ms: u64,
+) -> Result<Vec<OpenInterestSample>, BinancePublicError> {
+    binding.validate().map_err(|_| BinancePublicError::Binding)?;
+    if generation == 0 || received_at_ms == 0 { return Err(BinancePublicError::Generation) }
+    let value: Value = serde_json::from_str(payload).map_err(|_| BinancePublicError::Payload)?;
+    let rows = value.as_array().filter(|rows| rows.len() <= 500).ok_or(BinancePublicError::Payload)?;
+    let mut samples = Vec::with_capacity(rows.len());
+    for row in rows {
+        let object = row.as_object().ok_or(BinancePublicError::Payload)?;
+        check_symbol(object.get("symbol"), &native_symbol(&binding.symbol))?;
+        let time = positive_u64(object.get("timestamp"))?;
+        if samples.last().is_some_and(|previous: &OpenInterestSample| previous.exchange_time_ms >= time) {
+            return Err(BinancePublicError::Sequence);
+        }
+        let quantity = non_negative_decimal(object.get("sumOpenInterest"))?;
+        let notional = non_negative_decimal(object.get("sumOpenInterestValue"))?;
+        let sample = OpenInterestSample {
+            symbol: binding.symbol.clone(), generation, received_at_ms,
+            exchange_time_ms: time,
+            time_source: venue_domain::MarketTimeSource::Exchange,
+            sampling_interval_ms: Some(300_000),
+            native_quantity: quantity,
+            native_unit: OpenInterestUnit::BaseAsset,
+            base_quantity: FieldState::Known(quantity),
+            quote_notional: FieldState::Known(notional),
+            quote_asset: Some(binding.symbol.quote().to_owned()),
+        };
+        if !sample.is_valid() { return Err(BinancePublicError::Value) }
+        samples.push(sample);
+    }
+    Ok(samples)
+}
+
 /// Parses the array returned by Binance USDⓈ-M `GET /fapi/v1/klines`. This endpoint does not
 /// include a symbol in each row, so the caller must bind the HTTP request to `binding`; rows whose
 /// close is not yet before the local receive time are intentionally filtered out as forming bars.
@@ -858,6 +974,25 @@ pub fn parse_public_market_rest_klines(
     received_at_ms: u64,
     interval: BinanceKlineInterval,
 ) -> Result<Vec<PublicBar>, BinancePublicError> {
+    parse_public_market_rest_klines_with_forming(
+        payload,
+        binding,
+        generation,
+        received_at_ms,
+        interval,
+    )
+    .map(|(closed, _)| closed)
+}
+
+/// The last REST row can be the current candle. Return it separately so callers
+/// can display it without treating it as a confirmed close in indicators.
+pub fn parse_public_market_rest_klines_with_forming(
+    payload: &str,
+    binding: &PublicMarketBinding,
+    generation: u64,
+    received_at_ms: u64,
+    interval: BinanceKlineInterval,
+) -> Result<(Vec<PublicBar>, Option<PublicBar>), BinancePublicError> {
     binding
         .validate()
         .map_err(|_| BinancePublicError::Binding)?;
@@ -873,6 +1008,7 @@ pub fn parse_public_market_rest_klines(
         .cloned()
         .ok_or(BinancePublicError::Payload)?;
     let mut bars = Vec::with_capacity(rows.len());
+    let mut forming = None;
     let mut previous_sequence = None;
     for row in rows {
         let fields = row.as_array().ok_or(BinancePublicError::Payload)?;
@@ -886,16 +1022,19 @@ pub fn parse_public_market_rest_klines(
             return Err(BinancePublicError::Sequence);
         }
         previous_sequence = Some(values.sequence);
-        if values.close_time_ms >= received_at_ms {
-            continue;
-        }
         let bar = values.into_public_bar(binding.symbol.clone(), generation, received_at_ms);
         if !bar.is_valid() {
             return Err(BinancePublicError::Value);
         }
-        bars.push(bar);
+        if bar.close_time_ms >= received_at_ms {
+            if bar.open_time_ms == received_at_ms - received_at_ms % bar.interval_ms {
+                forming = Some(bar);
+            }
+        } else {
+            bars.push(bar);
+        }
     }
-    Ok(bars)
+    Ok((bars, forming))
 }
 
 fn public_market_stream_object(
@@ -1369,6 +1508,43 @@ mod public_market_tests {
     }
 
     #[test]
+    fn mark_funding_is_bound_to_exact_usdm_symbol_and_preserves_rate() -> Result<(), Box<dyn std::error::Error>> {
+        let binding = binding()?;
+        let frame = r#"{"stream":"btcusdt@markPrice@1s","data":{"e":"markPriceUpdate","E":1000,"s":"BTCUSDT","p":"100","i":"99","P":"0","r":"-0.0001","T":10000,"st":1}}"#;
+        let parsed = parse_public_mark_funding(frame, &binding, 7, 1001)?;
+        assert_eq!(parsed.fact().funding_rate, Decimal::new(-1, 4));
+        assert_eq!(parsed.fact().next_funding_time_ms, Some(10_000));
+        assert_eq!(parsed.fact().estimated_settle_price, FieldState::NotApplicable);
+        assert!(parse_public_mark_funding(frame.replace("BTCUSDT", "BTCUSDC").as_str(), &binding, 7, 1001).is_err());
+        assert!(parse_public_mark_funding(frame.replace("\"st\":1", "\"st\":2").as_str(), &binding, 7, 1001).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn dogeusdc_open_interest_keeps_native_symbol_and_five_minute_cadence() -> Result<(), Box<dyn std::error::Error>> {
+        let binding = PublicMarketBinding::binance_usds_m("DOGE/USDC".parse()?)?;
+        let current = parse_public_open_interest_current(
+            r#"{"symbol":"DOGEUSDC","openInterest":"123.5","time":600000}"#,
+            &binding, 7, 600001,
+        )?;
+        assert_eq!(current.base_quantity, FieldState::Known(Decimal::new(1235, 1)));
+        assert_eq!(current.sampling_interval_ms, None);
+        assert_eq!(current.quote_asset, None);
+        let history = parse_public_open_interest_history(
+            r#"[{"symbol":"DOGEUSDC","sumOpenInterest":"100","sumOpenInterestValue":"20","timestamp":300000},{"symbol":"DOGEUSDC","sumOpenInterest":"123.5","sumOpenInterestValue":"24.7","timestamp":600000}]"#,
+            &binding, 7, 600001,
+        )?;
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[1].sampling_interval_ms, Some(300_000));
+        assert_eq!(history[1].quote_asset.as_deref(), Some("USDC"));
+        assert!(parse_public_open_interest_current(
+            r#"{"symbol":"DOGEUSDT","openInterest":"123.5","time":600000}"#,
+            &binding, 7, 600001,
+        ).is_err());
+        Ok(())
+    }
+
+    #[test]
     fn public_market_parses_direct_and_combined_bbo_trade_and_depth20()
     -> Result<(), Box<dyn std::error::Error>> {
         let binding = binding()?;
@@ -1511,6 +1687,16 @@ mod public_market_tests {
         assert_eq!(bars.len(), 1);
         assert_eq!(bars[0].open_time_ms, 60_000);
         assert!(bars[0].is_valid());
+        let (closed, forming) = parse_public_market_rest_klines_with_forming(
+            payload,
+            &binding,
+            7,
+            150_000,
+            BinanceKlineInterval::OneMinute,
+        )?;
+        assert_eq!(closed, bars);
+        assert_eq!(forming.as_ref().map(|bar| bar.open_time_ms), Some(120_000));
+        assert!(forming.is_some_and(|bar| bar.is_valid()));
         assert_eq!(
             parse_public_market_rest_klines(
                 r#"[[120000,"100","110","90","105","2",179999,"200",2,"1","100","0"],[60000,"100","110","90","105","2",119999,"200",2,"1","100","0"]]"#,

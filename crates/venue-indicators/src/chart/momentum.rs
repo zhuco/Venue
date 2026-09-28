@@ -47,7 +47,10 @@ impl Rsi {
         self.average_loss = None;
     }
 
-    fn update_close(&mut self, close: Decimal) -> Result<Option<Decimal>, ChartIndicatorError> {
+    pub(super) fn update_close(
+        &mut self,
+        close: Decimal,
+    ) -> Result<Option<Decimal>, ChartIndicatorError> {
         let Some(previous) = self.previous_close.replace(close) else {
             return Ok(None);
         };

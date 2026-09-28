@@ -126,7 +126,7 @@ fn missing_close_requests_history_resync_and_rejects_old_events()
                     high: 100.into(),
                     low: 100.into(),
                     close: 100.into(),
-                    volume: 1.into(),
+                    volume: Some(1.into()),
                 },
                 study_bar: Box::new(missing_predecessor),
                 closed: true,
@@ -166,6 +166,7 @@ fn selection(server: MarketServer) -> MarketSelection {
 fn catalog(symbol: &str, scale: u32) -> LocalMarketClientEvent {
     LocalMarketClientEvent::Catalog(vec![MarketInstrument {
         symbol: symbol.into(),
+        price_tick: Some(rust_decimal::Decimal::new(1, scale)),
         price_scale: scale,
         quantity_scale: 3,
     }])

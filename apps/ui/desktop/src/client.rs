@@ -33,6 +33,7 @@ const MAX_SSE_FRAME_BYTES: usize = 1_024 * 1_024;
 
 #[derive(Clone, Debug)]
 pub enum ClientEvent {
+    AccountClock(crate::execution_view::account_clock::AccountClock),
     AccountScoped {
         scope: AccountScope,
         event: Box<ClientEvent>,
@@ -40,6 +41,10 @@ pub enum ClientEvent {
     TerminalAccountProjection {
         credential_id: String,
         projection: Option<TerminalAccountProjection>,
+    },
+    TerminalAccountSharedProjection {
+        credential_id: String,
+        projection: Option<std::sync::Arc<TerminalAccountProjection>>,
     },
     TerminalExecutions(Vec<ExecutorCommandSummary>),
     TerminalExecutionUpdated(ExecutorCommandSummary),
@@ -119,8 +124,8 @@ impl ControlClient {
     ) -> Self {
         let (event_tx, events) = unbounded();
         let (command_tx, command_rx) = unbounded();
-        let (terminal_order_tx, terminal_order_rx) = unbounded();
-        let (terminal_cancel_tx, terminal_cancel_rx) = unbounded();
+        let (terminal_order_tx, terminal_order_rx) = bounded(16);
+        let (terminal_cancel_tx, terminal_cancel_rx) = bounded(16);
         let (terminal_position_tx, terminal_position_rx) = bounded(1);
         #[cfg(not(target_arch = "wasm32"))]
         let terminal_wake = std::sync::Arc::new(tokio::sync::Notify::new());
@@ -220,11 +225,11 @@ impl ControlClient {
         #[cfg(not(target_arch = "wasm32"))]
         crate::latency_evidence::submission(&request.request_id, "queued");
         self.terminal_order_tx
-            .send(Scoped {
+            .try_send(Scoped {
                 scope,
                 value: request,
             })
-            .map_err(|_| ClientError::Closed)?;
+            .map_err(terminal_queue_error)?;
         #[cfg(not(target_arch = "wasm32"))]
         self.terminal_wake.notify_one();
         Ok(())
@@ -240,11 +245,11 @@ impl ControlClient {
             .map_err(|_| ClientError::TerminalProtocol)?;
         let scope = self.terminal_scope(scope, &request.credential_id)?;
         self.terminal_cancel_tx
-            .send(Scoped {
+            .try_send(Scoped {
                 scope,
                 value: request,
             })
-            .map_err(|_| ClientError::Closed)?;
+            .map_err(terminal_queue_error)?;
         #[cfg(not(target_arch = "wasm32"))]
         self.terminal_wake.notify_one();
         Ok(())
@@ -274,7 +279,9 @@ impl ControlClient {
             .ok_or(ClientError::WriteGateClosed)
     }
 
-    pub fn subscribe_terminal(&self, request: Scoped<TerminalProjectionRequest>) {
+    pub fn subscribe_terminal(&self, mut request: Scoped<TerminalProjectionRequest>) {
+        request.value.symbols.sort();
+        request.value.symbols.dedup();
         if request.value.validate().is_ok() {
             #[cfg(not(target_arch = "wasm32"))]
             self.terminal_projection_tx.send_if_modified(|current| {
@@ -355,6 +362,10 @@ impl Drop for ControlClient {
 
 #[derive(Debug, thiserror::Error)]
 pub enum ClientError {
+    #[error(
+        "本地提交队列已满，本次未发送；请等待回执 / Local queue full; this request was not sent"
+    )]
+    QueueFull,
     #[error("control command does not satisfy the protocol: {0}")]
     Protocol(venue_control_protocol::ProtocolError),
     #[error("terminal request does not satisfy the protocol")]
@@ -365,6 +376,13 @@ pub enum ClientError {
     Closed,
     #[error("the scoped event stream is not currently healthy; writes are closed")]
     WriteGateClosed,
+}
+
+fn terminal_queue_error<T>(error: crossbeam_channel::TrySendError<T>) -> ClientError {
+    match error {
+        crossbeam_channel::TrySendError::Full(_) => ClientError::QueueFull,
+        crossbeam_channel::TrySendError::Disconnected(_) => ClientError::Closed,
+    }
 }
 
 fn command_scope(command: &ControlCommandRequest) -> UiAccountScope {

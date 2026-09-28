@@ -315,20 +315,80 @@ pub struct PublicTicker {
     pub ask_quantity: Decimal,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MarketTimeSource {
+    #[default]
+    Exchange,
+    /// The public snapshot omitted a timestamp; this is when this client received it.
+    LocalObservation,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct MarkFunding {
     pub symbol: Symbol,
     pub generation: u64,
     pub received_at_ms: u64,
     pub exchange_time_ms: u64,
-    pub next_funding_time_ms: u64,
-    pub mark_price: Price,
-    pub index_price: Price,
+    #[serde(default)]
+    pub time_source: MarketTimeSource,
+    pub next_funding_time_ms: Option<u64>,
+    pub mark_price: FieldState<Price>,
+    pub index_price: FieldState<Price>,
     #[serde(with = "rust_decimal::serde::str")]
     pub funding_rate: Decimal,
     pub estimated_settle_price: FieldState<Price>,
     pub predicted_funding_rate: FieldState<Decimal>,
     pub unknown_reason: Option<UnknownReason>,
+}
+
+/// Public contract open interest. Venue and product remain bound by the containing market scope.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum OpenInterestUnit {
+    BaseAsset,
+    Contracts { base_per_contract: Decimal },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct OpenInterestSample {
+    pub symbol: Symbol,
+    pub generation: u64,
+    pub received_at_ms: u64,
+    pub exchange_time_ms: u64,
+    #[serde(default)]
+    pub time_source: MarketTimeSource,
+    /// None for an instantaneous observation; historical sources declare their real cadence.
+    pub sampling_interval_ms: Option<u64>,
+    pub native_quantity: Decimal,
+    pub native_unit: OpenInterestUnit,
+    pub base_quantity: FieldState<Decimal>,
+    pub quote_notional: FieldState<Decimal>,
+    pub quote_asset: Option<String>,
+}
+
+impl OpenInterestSample {
+    #[must_use]
+    pub fn is_valid(&self) -> bool {
+        self.generation > 0
+            && self.exchange_time_ms > 0
+            && self.received_at_ms > 0
+            && self.native_quantity >= Decimal::ZERO
+            && self.sampling_interval_ms.is_none_or(|period| period > 0)
+            && match (&self.native_unit, &self.base_quantity) {
+                (OpenInterestUnit::BaseAsset, FieldState::Known(base)) => *base == self.native_quantity,
+                (OpenInterestUnit::Contracts { base_per_contract }, FieldState::Known(base)) => {
+                    *base_per_contract > Decimal::ZERO
+                        && self.native_quantity.checked_mul(*base_per_contract) == Some(*base)
+                }
+                (OpenInterestUnit::Contracts { base_per_contract }, _) => *base_per_contract > Decimal::ZERO,
+                _ => false,
+            }
+            && match (&self.quote_notional, &self.quote_asset) {
+                (FieldState::Known(value), Some(asset)) => *value >= Decimal::ZERO && !asset.is_empty(),
+                (FieldState::Known(_), None) => false,
+                _ => true,
+            }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

@@ -4,15 +4,21 @@ use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use venue_control_protocol::{UiBar, UiBookLevel, UiTrade};
-use venue_domain::{FieldState, PublicBar};
+use venue_domain::{FieldState, MarkFunding, OpenInterestSample, PublicBar};
 use venue_gateway_api::PublicMarketBinding;
 use venue_indicators::chart::{
     ChartIndicatorError, ChartStudyConfig, ChartStudyEngine, ChartStudyValues,
 };
 
-use crate::chart::{ChartInterval, ChartStudyPoint};
+use crate::chart::{BaseMinuteStudy, ChartInterval, ChartStudyPoint};
 
 pub const MAX_BARS: usize = 10_000;
+// A 200k-bar 1m source can retain about four months of deliberately requested history.
+// It is separate from the displayed-candle limit and uses compact studies.
+pub const MAX_BASE_MINUTE_BARS: usize = 200_000;
+// Leave room within the 256 MiB indicator budget for chart results and heatmap workers.
+const MAX_BASE_MINUTE_CACHE_BYTES: usize = 124 * 1024 * 1024;
+const MAX_SESSION_DAY_CACHE_BINDINGS: usize = 8;
 pub const MAX_TRADES: usize = 200;
 pub const MAX_BOOK_LEVELS: usize = 20;
 
@@ -27,6 +33,22 @@ pub struct HistoryRequest {
     pub generation: u64,
     pub selection: MarketSelection,
     pub before: u64,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct SharedHistoryRequest {
+    pub request_id: u64,
+    pub generation: u64,
+    pub binding: PublicMarketBinding,
+    pub interval: ChartInterval,
+    pub before: u64,
+    /// The last known bar before an interior gap. Prefix requests leave this empty.
+    pub gap_after: Option<u64>,
+}
+
+pub(crate) fn history_page_covers_gap(bars: &[PublicBar], before: u64, gap_after: Option<u64>) -> bool {
+    gap_after.is_none_or(|left| bars.iter()
+        .any(|bar| bar.open_time_ms > left && bar.open_time_ms < before))
 }
 
 impl MarketSelection {
@@ -94,6 +116,11 @@ pub enum MarketPayload {
         ask: Decimal,
     },
     Trade(UiTrade),
+    Funding(MarkFunding),
+    OpenInterestCurrent(OpenInterestSample),
+    OpenInterestHistory(Vec<OpenInterestSample>),
+    OpenInterestUnavailable(String),
+    OpenInterestHistoryUnavailable(String),
     Status {
         status: MarketStatus,
         detail: Option<String>,
@@ -112,6 +139,8 @@ pub struct MarketEnvelope {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct LocalMarketView {
+    pub revision: u64,
+    pub bar_revision: u64,
     history_started_ms: u64,
     pub history_loading: bool,
     pub history_exhausted: bool,
@@ -122,14 +151,24 @@ pub struct LocalMarketView {
     pub status_detail: Option<String>,
     pub bars: Vec<UiBar>,
     pub studies: Vec<ChartStudyPoint>,
+    pub study_error: Option<String>,
     pub bids: Vec<UiBookLevel>,
     pub asks: Vec<UiBookLevel>,
     pub trades: Vec<UiTrade>,
+    pub funding: Option<MarkFunding>,
+    pub open_interest_current: Option<OpenInterestSample>,
+    pub open_interest_history: Vec<OpenInterestSample>,
+    pub open_interest_error: Option<String>,
+    pub open_interest_history_error: Option<String>,
     pub last: Option<Decimal>,
     pub last_price_event_ms: Option<u64>,
     pub last_price_received_ms: Option<u64>,
     pub bid: Option<Decimal>,
     pub ask: Option<Decimal>,
+    pub book_event_ms: Option<u64>,
+    pub book_received_ms: Option<u64>,
+    pub depth_event_ms: Option<u64>,
+    pub depth_received_ms: Option<u64>,
     pub last_event_ms: Option<u64>,
     pub last_received_ms: Option<u64>,
     pub latency_ms: Option<u64>,
@@ -146,6 +185,8 @@ impl LocalMarketView {
 
     fn empty(generation: u64, selection: MarketSelection) -> Self {
         Self {
+            revision: 0,
+            bar_revision: 0,
             history_started_ms: 0,
             history_loading: false,
             history_exhausted: false,
@@ -156,14 +197,24 @@ impl LocalMarketView {
             status_detail: None,
             bars: Vec::new(),
             studies: Vec::new(),
+            study_error: None,
             bids: Vec::new(),
             asks: Vec::new(),
             trades: Vec::new(),
+            funding: None,
+            open_interest_current: None,
+            open_interest_history: Vec::new(),
+            open_interest_error: None,
+            open_interest_history_error: None,
             last: None,
             last_price_event_ms: None,
             last_price_received_ms: None,
             bid: None,
             ask: None,
+            book_event_ms: None,
+            book_received_ms: None,
+            depth_event_ms: None,
+            depth_received_ms: None,
             last_event_ms: None,
             last_received_ms: None,
             latency_ms: None,
@@ -258,6 +309,7 @@ impl LocalMarketReducer {
             measured_at,
         } = &envelope.payload
         {
+            self.view.revision = self.view.revision.wrapping_add(1);
             self.view.connection_rtt_ms = Some(*millis);
             self.view.connection_rtt_at = Some(*measured_at);
             return Ok(ReduceOutcome::Applied);
@@ -269,6 +321,9 @@ impl LocalMarketReducer {
         let exchange_event = !matches!(
             &envelope.payload,
             MarketPayload::RestHistory { .. } | MarketPayload::Status { .. }
+                | MarketPayload::Funding(_) | MarketPayload::OpenInterestCurrent(_)
+                | MarketPayload::OpenInterestHistory(_) | MarketPayload::OpenInterestUnavailable(_)
+                | MarketPayload::OpenInterestHistoryUnavailable(_)
         );
         let previous_price_event_ms = self.last_price_event_ms;
         match envelope.payload {
@@ -279,9 +334,84 @@ impl LocalMarketReducer {
                 study_bar,
                 closed,
             } => self.apply_bar(bar, *study_bar, closed, envelope.event_time_ms)?,
-            MarketPayload::BookSnapshot { bids, asks } => self.apply_book(bids, asks)?,
-            MarketPayload::Bbo { bid, ask } => self.apply_bbo(bid, ask)?,
+            MarketPayload::BookSnapshot { bids, asks } => {
+                if self
+                    .view
+                    .depth_event_ms
+                    .is_some_and(|time| time > envelope.event_time_ms)
+                {
+                    return Ok(ReduceOutcome::Applied);
+                }
+                self.apply_book(bids, asks)?;
+                self.view.depth_event_ms = Some(envelope.event_time_ms);
+                self.view.depth_received_ms = Some(envelope.received_ms);
+                self.apply_best_prices(
+                    self.view.bids.first().map(|level| level.price),
+                    self.view.asks.first().map(|level| level.price),
+                    envelope.event_time_ms,
+                    envelope.received_ms,
+                )?;
+            }
+            MarketPayload::Bbo { bid, ask } => {
+                self.apply_best_prices(
+                    Some(bid),
+                    Some(ask),
+                    envelope.event_time_ms,
+                    envelope.received_ms,
+                )?;
+            }
             MarketPayload::Trade(trade) => self.apply_trade(trade)?,
+            MarketPayload::Funding(funding) => {
+                if funding.symbol != self.view.selection.binding.symbol
+                    || funding.generation != envelope.generation
+                    || funding.exchange_time_ms != envelope.event_time_ms
+                    || funding.received_at_ms != envelope.received_ms
+                {
+                    return Err(LocalMarketError::ScopeMismatch);
+                }
+                if self.view.funding.as_ref().is_none_or(|previous| {
+                    previous.exchange_time_ms <= funding.exchange_time_ms
+                }) {
+                    self.view.funding = Some(funding);
+                }
+            }
+            MarketPayload::OpenInterestCurrent(sample) => {
+                if !sample.is_valid()
+                    || sample.symbol != self.view.selection.binding.symbol
+                    || sample.generation != envelope.generation
+                    || sample.sampling_interval_ms.is_some()
+                {
+                    return Err(LocalMarketError::ScopeMismatch);
+                }
+                if self.view.open_interest_current.as_ref().is_none_or(|previous| {
+                    previous.exchange_time_ms <= sample.exchange_time_ms
+                }) {
+                    self.view.open_interest_current = Some(sample);
+                    self.view.open_interest_error = None;
+                }
+            }
+            MarketPayload::OpenInterestHistory(samples) => {
+                if samples.len() > 500 || samples.iter().any(|sample| {
+                    !sample.is_valid()
+                        || sample.symbol != self.view.selection.binding.symbol
+                        || sample.generation != envelope.generation
+                        || sample.sampling_interval_ms != Some(300_000)
+                }) || samples.windows(2).any(|pair| pair[0].exchange_time_ms >= pair[1].exchange_time_ms) {
+                    return Err(LocalMarketError::ScopeMismatch);
+                }
+                if self.view.open_interest_history.last().is_none_or(|previous| {
+                    samples.last().is_some_and(|latest| latest.exchange_time_ms >= previous.exchange_time_ms)
+                }) {
+                    self.view.open_interest_history = samples;
+                    self.view.open_interest_history_error = None;
+                }
+            }
+            MarketPayload::OpenInterestUnavailable(detail) => {
+                self.view.open_interest_error = Some(detail);
+            }
+            MarketPayload::OpenInterestHistoryUnavailable(detail) => {
+                self.view.open_interest_history_error = Some(detail);
+            }
             MarketPayload::Status { status, detail } => {
                 if status != MarketStatus::Live {
                     self.view.connection_rtt_ms = None;
@@ -305,6 +435,7 @@ impl LocalMarketReducer {
             self.view.last_price_event_ms = Some(self.last_price_event_ms);
             self.view.last_price_received_ms = Some(envelope.received_ms);
         }
+        self.view.revision = self.view.revision.wrapping_add(1);
         self.view.last_event_ms = Some(envelope.event_time_ms);
         if exchange_event || self.view.last_received_ms.is_none() {
             self.view.last_received_ms = Some(envelope.received_ms);
@@ -320,31 +451,56 @@ impl LocalMarketReducer {
             return;
         }
         let Some(last_received_ms) = self.view.last_received_ms else {
+            self.view.revision = self.view.revision.wrapping_add(1);
             self.view.status = MarketStatus::Stale;
             self.view.status_detail = Some("no market event received".to_owned());
             return;
         };
         if now_ms.saturating_sub(last_received_ms) > stale_after_ms {
+            self.view.revision = self.view.revision.wrapping_add(1);
             self.view.status = MarketStatus::Stale;
             self.view.status_detail = Some("market event timeout".to_owned());
         }
     }
 
     fn apply_history(&mut self, mut bars: Vec<PublicBar>) -> Result<(), LocalMarketError> {
-        self.forming_bar = None;
         bars.sort_by_key(|bar| bar.open_time_ms);
+        if bars.windows(2).any(|pair| pair[0].open_time_ms == pair[1].open_time_ms) {
+            return Err(LocalMarketError::InvalidBar);
+        }
+        for bar in &bars { validate_study_bar(bar, &self.view.selection, self.view.generation)?; }
+        let same_values = |old: &PublicBar, next: &PublicBar| {
+            old.symbol == next.symbol && old.open_time_ms == next.open_time_ms
+                && old.close_time_ms == next.close_time_ms && old.interval_ms == next.interval_ms
+                && old.open == next.open && old.high == next.high && old.low == next.low
+                && old.close == next.close && old.base_volume == next.base_volume
+                && old.quote_volume == next.quote_volume && old.trade_count == next.trade_count
+                && old.taker_buy_base_volume == next.taker_buy_base_volume
+                && old.taker_buy_quote_volume == next.taker_buy_quote_volume
+        };
+        if !bars.is_empty() && bars.iter().all(|bar| self.closed_facts.get(&bar.open_time_ms)
+            .is_some_and(|old| same_values(old, bar))) { return Ok(()); }
+        if let (Some((old_first, _)), Some((old_last, _)), Some(new_first), Some(new_last)) =
+            (self.closed_facts.first_key_value(), self.closed_facts.last_key_value(),
+                bars.first(), bars.last()) {
+            let step = self.view.selection.interval.duration_ms();
+            if new_first.open_time_ms <= old_last.saturating_add(step)
+                && *old_first <= new_last.open_time_ms.saturating_add(step) {
+                let mut merged = self.closed_facts.clone();
+                for bar in bars { merged.insert(bar.open_time_ms, bar); }
+                bars = merged.into_values().rev().take(MAX_BARS).collect::<Vec<_>>()
+                    .into_iter().rev().collect();
+            }
+        }
+        self.forming_bar = None;
         self.view.bars.clear();
         self.view.studies.clear();
         self.closed_bars.clear();
         self.closed_facts.clear();
         self.studies.reset();
         for bar in bars {
-            validate_study_bar(&bar, &self.view.selection)?;
             let ui_bar = ui_bar_from_public(&bar)?;
-            let values = self
-                .studies
-                .ingest_closed(&bar)
-                .map_err(LocalMarketError::Indicator)?;
+            let point = self.study_closed_or_empty(&bar)?;
             self.closed_bars.insert(bar.open_time_ms);
             self.closed_facts.insert(bar.open_time_ms, bar);
             upsert_bar(&mut self.view.bars, ui_bar.clone());
@@ -353,7 +509,7 @@ impl LocalMarketReducer {
                 ChartStudyPoint {
                     open_time_ms: ui_bar.open_time_ms,
                     confirmed: true,
-                    ..study_point(values)
+                    ..point
                 },
             );
         }
@@ -370,6 +526,7 @@ impl LocalMarketReducer {
             .last_key_value()
             .map_or(0, |(_, bar)| bar.close_time_ms);
         self.last_bar_event_ms = 0;
+        self.view.bar_revision = self.view.bar_revision.wrapping_add(1);
         Ok(())
     }
 
@@ -381,7 +538,7 @@ impl LocalMarketReducer {
         event_time_ms: u64,
     ) -> Result<(), LocalMarketError> {
         validate_bar(&bar, self.view.selection.interval)?;
-        validate_study_bar(&study_bar, &self.view.selection)?;
+        validate_study_bar(&study_bar, &self.view.selection, self.view.generation)?;
         if bar.open_time_ms != study_bar.open_time_ms {
             return Err(LocalMarketError::ScopeMismatch);
         }
@@ -432,16 +589,13 @@ impl LocalMarketReducer {
                     return self.rebuild_studies_and_bars();
                 }
             } else {
-                let values = self
-                    .studies
-                    .ingest_closed(&study_bar)
-                    .map_err(LocalMarketError::Indicator)?;
+                let point = self.study_closed_or_empty(&study_bar)?;
                 upsert_study(
                     &mut self.view.studies,
                     ChartStudyPoint {
                         open_time_ms: bar.open_time_ms,
                         confirmed: true,
-                        ..study_point(values)
+                        ..point
                     },
                 );
                 self.closed_facts.insert(bar.open_time_ms, study_bar);
@@ -449,20 +603,18 @@ impl LocalMarketReducer {
             self.closed_bars.insert(bar.open_time_ms);
         } else {
             self.forming_bar = Some(study_bar.clone());
-            let values = self
-                .studies
-                .preview(&study_bar)
-                .map_err(LocalMarketError::Indicator)?;
+            let point = self.study_preview_or_empty(&study_bar)?;
             upsert_study(
                 &mut self.view.studies,
                 ChartStudyPoint {
                     open_time_ms: bar.open_time_ms,
                     confirmed: false,
-                    ..study_point(values)
+                    ..point
                 },
             );
         }
         upsert_bar(&mut self.view.bars, bar);
+        if closed { self.view.bar_revision = self.view.bar_revision.wrapping_add(1); }
         while self.closed_facts.len() > MAX_BARS {
             self.closed_facts.pop_first();
         }
@@ -481,24 +633,22 @@ impl LocalMarketReducer {
     }
 
     fn rebuild_studies_and_bars(&mut self) -> Result<(), LocalMarketError> {
+        self.view.bar_revision = self.view.bar_revision.wrapping_add(1);
         let live_price = self.view.last;
         self.studies = ChartStudyEngine::with_config(&self.study_config)
             .map_err(LocalMarketError::Indicator)?;
         self.view.studies.clear();
         self.view.bars.clear();
         self.closed_bars.clear();
-        for bar in self.closed_facts.values() {
-            let values = self
-                .studies
-                .ingest_closed(bar)
-                .map_err(LocalMarketError::Indicator)?;
-            let ui_bar = ui_bar_from_public(bar)?;
+        for bar in self.closed_facts.values().cloned().collect::<Vec<_>>() {
+            let point = self.study_closed_or_empty(&bar)?;
+            let ui_bar = ui_bar_from_public(&bar)?;
             self.closed_bars.insert(bar.open_time_ms);
             self.view.bars.push(ui_bar);
             self.view.studies.push(ChartStudyPoint {
                 open_time_ms: bar.open_time_ms,
                 confirmed: true,
-                ..study_point(values)
+                ..point
             });
         }
         self.view.last = self.view.bars.last().map(|bar| bar.close);
@@ -516,6 +666,36 @@ impl LocalMarketReducer {
         Ok(())
     }
 
+    fn study_closed_or_empty(&mut self, bar: &PublicBar) -> Result<ChartStudyPoint, LocalMarketError> {
+        match self.studies.ingest_closed(bar) {
+            Ok(values) => {
+                self.view.study_error = None;
+                Ok(study_point(values))
+            }
+            Err(ChartIndicatorError::DiscontinuousBar) => Err(LocalMarketError::Indicator(ChartIndicatorError::DiscontinuousBar)),
+            Err(error) => {
+                self.view.study_error = Some(error.to_string());
+                self.studies = ChartStudyEngine::with_config(&self.study_config)
+                    .map_err(LocalMarketError::Indicator)?;
+                Ok(ChartStudyPoint::default())
+            }
+        }
+    }
+
+    fn study_preview_or_empty(&mut self, bar: &PublicBar) -> Result<ChartStudyPoint, LocalMarketError> {
+        match self.studies.preview(bar) {
+            Ok(values) => {
+                self.view.study_error = None;
+                Ok(study_point(values))
+            }
+            Err(ChartIndicatorError::DiscontinuousBar) => Err(LocalMarketError::Indicator(ChartIndicatorError::DiscontinuousBar)),
+            Err(error) => {
+                self.view.study_error = Some(error.to_string());
+                Ok(ChartStudyPoint::default())
+            }
+        }
+    }
+
     fn reconfigure_studies(
         &mut self,
         study_config: ChartStudyConfig,
@@ -527,15 +707,33 @@ impl LocalMarketReducer {
             .validate()
             .map_err(LocalMarketError::Indicator)?;
         self.study_config = study_config;
+        self.view.revision = self.view.revision.wrapping_add(1);
         self.rebuild_studies_and_bars()
     }
 
-    fn apply_bbo(&mut self, bid: Decimal, ask: Decimal) -> Result<(), LocalMarketError> {
-        if bid <= Decimal::ZERO || ask <= Decimal::ZERO || bid >= ask {
+    fn apply_best_prices(
+        &mut self,
+        bid: Option<Decimal>,
+        ask: Option<Decimal>,
+        event: u64,
+        received: u64,
+    ) -> Result<(), LocalMarketError> {
+        if bid.is_some_and(|price| price <= Decimal::ZERO)
+            || ask.is_some_and(|price| price <= Decimal::ZERO)
+            || bid.zip(ask).is_some_and(|(bid, ask)| bid >= ask)
+        {
             return Err(LocalMarketError::InvalidBbo);
         }
-        self.view.bid = Some(bid);
-        self.view.ask = Some(ask);
+        if self
+            .view
+            .book_event_ms
+            .is_none_or(|previous| event >= previous)
+        {
+            self.view.bid = bid;
+            self.view.ask = ask;
+            self.view.book_event_ms = Some(event);
+            self.view.book_received_ms = Some(received);
+        }
         Ok(())
     }
 
@@ -551,8 +749,6 @@ impl LocalMarketReducer {
         {
             return Err(LocalMarketError::CrossedBook);
         }
-        self.view.bid = bids.first().map(|level| level.price);
-        self.view.ask = asks.first().map(|level| level.price);
         self.view.bids = bids;
         self.view.asks = asks;
         Ok(())
@@ -580,17 +776,14 @@ impl LocalMarketReducer {
                 && trade.occurred_ms <= forming.close_time_ms
             {
                 apply_print_to_bar(&mut forming, trade.price)?;
-                let values = self
-                    .studies
-                    .preview(&forming)
-                    .map_err(LocalMarketError::Indicator)?;
+                let point = self.study_preview_or_empty(&forming)?;
                 upsert_bar(&mut self.view.bars, ui_bar_from_public(&forming)?);
                 upsert_study(
                     &mut self.view.studies,
                     ChartStudyPoint {
                         open_time_ms: forming.open_time_ms,
                         confirmed: false,
-                        ..study_point(values)
+                        ..point
                     },
                 );
                 self.forming_bar = Some(forming);
@@ -618,11 +811,121 @@ pub struct LocalMarketStore {
     generation: u64,
     reducers: BTreeMap<MarketSelection, LocalMarketReducer>,
     study_config: ChartStudyConfig,
-    chart_reducers: BTreeMap<String, LocalMarketReducer>,
+    chart_reducers: Vec<LocalMarketReducer>,
+    chart_bindings: BTreeMap<String, (MarketSelection, ChartStudyConfig)>,
     chart_previews: std::collections::VecDeque<(MarketSelection, Vec<UiBar>)>,
+    base_minutes: BTreeMap<PublicMarketBinding, BaseMinuteSeries>,
+    base_minute_tick: u64,
+    session_days: BTreeMap<PublicMarketBinding, SessionDaySeries>,
+    session_day_tick: u64,
+    shared_history_pending: BTreeMap<(PublicMarketBinding, ChartInterval), u64>,
+    next_shared_history_request_id: u64,
+    shared_history_retry_after: BTreeMap<(PublicMarketBinding, ChartInterval), u64>,
+    shared_history_exhausted_at: BTreeSet<(PublicMarketBinding, ChartInterval, u64)>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct SessionDaySeries {
+    bars: Vec<PublicBar>,
+    confirmed: BTreeSet<u64>,
+    last_used_tick: u64,
+}
+
+#[derive(Clone, Debug, Default)]
+struct BaseMinuteSeries {
+    bars: Vec<UiBar>,
+    studies: Vec<BaseMinuteStudy>,
+    facts: Vec<PublicBar>,
+    gap_right_edges: BTreeSet<u64>,
+    closed_revision: u64,
+    incarnation: u64,
+    last_used_tick: u64,
+}
+
+impl BaseMinuteSeries {
+    fn memory_bytes(&self) -> usize {
+        self.bars.capacity() * std::mem::size_of::<UiBar>()
+            + self.studies.capacity() * std::mem::size_of::<BaseMinuteStudy>()
+            + self.facts.capacity() * std::mem::size_of::<PublicBar>()
+            + self.facts.len() * 64 // Conservative allowance for symbol strings.
+            + self.gap_right_edges.len() * 48
+    }
+
+    fn prepare(bar: PublicBar, confirmed: bool)
+    -> Result<(PublicBar, UiBar, BaseMinuteStudy), LocalMarketError> {
+        let ui_bar = ui_bar_from_public(&bar)?;
+        let point = BaseMinuteStudy {
+            confirmed,
+            bar_vwap: venue_indicators::chart::bar_vwap(&bar),
+        };
+        Ok((bar, ui_bar, point))
+    }
+
+    fn insert(&mut self, bar: PublicBar, confirmed: bool) -> Result<(), LocalMarketError> {
+        let (bar, ui_bar, point) = Self::prepare(bar, confirmed)?;
+        self.insert_prepared(bar, ui_bar, point);
+        Ok(())
+    }
+
+    fn insert_prepared(&mut self, bar: PublicBar, ui_bar: UiBar, point: BaseMinuteStudy) {
+        let open_time_ms = bar.open_time_ms;
+        let confirmed = point.confirmed;
+        let mut closed_changed = confirmed;
+        match self.bars.binary_search_by_key(&open_time_ms, |item| item.open_time_ms) {
+            Ok(index) if self.studies[index].confirmed && !confirmed => return,
+            Ok(index) => {
+                closed_changed = confirmed && (self.bars[index] != ui_bar
+                    || self.studies[index].bar_vwap != point.bar_vwap
+                    || !self.studies[index].confirmed
+                    || self.facts[index].base_volume != bar.base_volume
+                    || self.facts[index].quote_volume != bar.quote_volume
+                    || self.facts[index].taker_buy_base_volume != bar.taker_buy_base_volume
+                    || self.facts[index].taker_buy_quote_volume != bar.taker_buy_quote_volume);
+                self.bars[index] = ui_bar;
+                self.studies[index] = point;
+                self.facts[index] = bar;
+            }
+            Err(index) => {
+                let previous = index.checked_sub(1).and_then(|previous| self.facts.get(previous))
+                    .map(|previous| previous.open_time_ms);
+                let next = self.facts.get(index).map(|next| next.open_time_ms);
+                if let Some(next) = next { self.gap_right_edges.remove(&next); }
+                if previous.is_some_and(|previous| previous.saturating_add(60_000) < open_time_ms) {
+                    self.gap_right_edges.insert(open_time_ms);
+                }
+                if let Some(next) = next
+                    && open_time_ms.saturating_add(60_000) < next {
+                    self.gap_right_edges.insert(next);
+                }
+                self.bars.insert(index, ui_bar);
+                self.studies.insert(index, point);
+                self.facts.insert(index, bar);
+            }
+        }
+        if closed_changed { self.closed_revision = self.closed_revision.saturating_add(1); }
+        if self.bars.len() > MAX_BASE_MINUTE_BARS {
+            let extra = self.bars.len() - MAX_BASE_MINUTE_BARS;
+            self.bars.drain(..extra);
+            self.studies.drain(..extra);
+            self.facts.drain(..extra);
+            if let Some(first) = self.facts.first() {
+                self.gap_right_edges.retain(|right| *right > first.open_time_ms);
+            }
+        }
+    }
 }
 
 impl LocalMarketStore {
+    pub(crate) fn retained_study_source_bytes(&self) -> usize {
+        let minute = self.base_minutes.values().fold(0_usize, |total, series|
+            total.saturating_add(series.memory_bytes()));
+        self.session_days.values().fold(minute, |total, series| {
+            total.saturating_add(series.bars.capacity() * std::mem::size_of::<PublicBar>())
+                .saturating_add(series.bars.len() * 64)
+                .saturating_add(series.confirmed.len() * 48)
+        })
+    }
+
     pub fn chart_preview(&self, selection: &MarketSelection) -> Option<&[UiBar]> {
         self.chart_previews
             .iter()
@@ -651,6 +954,7 @@ impl LocalMarketStore {
         if before == 0 {
             return None;
         }
+        view.revision = view.revision.wrapping_add(1);
         view.history_loading = true;
         view.history_started_ms = now;
         view.history_error = None;
@@ -672,6 +976,7 @@ impl LocalMarketStore {
         let Some(base) = self.reducers.get_mut(&request.selection) else {
             return Ok(0);
         };
+        base.view.revision = base.view.revision.wrapping_add(1);
         base.view.history_loading = false;
         let bars = match result {
             Ok(bars) => bars,
@@ -695,7 +1000,7 @@ impl LocalMarketStore {
         let mut candidate = base.clone();
         let mut added = 0;
         for bar in bars {
-            validate_study_bar(&bar, &request.selection)?;
+            validate_study_bar(&bar, &request.selection, request.generation)?;
             if bar.open_time_ms >= request.before {
                 return Err(LocalMarketError::InvalidBar);
             }
@@ -717,15 +1022,16 @@ impl LocalMarketStore {
         for (key, chart) in self
             .chart_reducers
             .iter()
+            .enumerate()
             .filter(|(_, chart)| chart.view.selection == request.selection)
         {
             let mut replacement = candidate.clone();
             replacement.reconfigure_studies(chart.study_config.clone())?;
-            charts.push((key.clone(), replacement));
+            charts.push((key, replacement));
         }
         *base = candidate;
         for (key, replacement) in charts {
-            self.chart_reducers.insert(key, replacement);
+            self.chart_reducers[key] = replacement;
         }
         Ok(added)
     }
@@ -778,8 +1084,53 @@ impl LocalMarketStore {
         }
         self.generation = generation;
         self.reducers = reducers;
+        self.reattach_shared_sources();
+        self.shared_history_pending.clear();
+        self.shared_history_retry_after.clear();
+        self.shared_history_exhausted_at.clear();
         self.chart_reducers.clear();
+        self.chart_bindings.clear();
         Ok(Some(generation))
+    }
+
+    fn reattach_shared_sources(&mut self) {
+        let active = self.reducers.keys().map(|selection| selection.binding.clone())
+            .collect::<BTreeSet<_>>();
+        if active.is_empty() {
+            self.base_minutes.clear();
+            self.session_days.clear();
+            return;
+        }
+        for (binding, series) in &mut self.base_minutes {
+            if !active.contains(binding) { continue; }
+            if series.studies.last().is_some_and(|point| !point.confirmed) {
+                if let Some(forming) = series.facts.pop() {
+                    series.gap_right_edges.remove(&forming.open_time_ms);
+                }
+                series.bars.pop();
+                series.studies.pop();
+            }
+            for bar in &mut series.facts { bar.generation = self.generation; }
+            self.base_minute_tick = self.base_minute_tick.saturating_add(1);
+            series.incarnation = self.base_minute_tick;
+            series.last_used_tick = self.base_minute_tick;
+        }
+        self.base_minutes.retain(|_, series| !series.facts.is_empty());
+        for (binding, series) in &mut self.session_days {
+            if !active.contains(binding) { continue; }
+            series.bars.retain(|bar| series.confirmed.contains(&bar.open_time_ms));
+            for bar in &mut series.bars { bar.generation = self.generation; }
+            self.session_day_tick = self.session_day_tick.saturating_add(1);
+            series.last_used_tick = self.session_day_tick;
+        }
+        self.session_days.retain(|_, series| !series.bars.is_empty());
+        while self.session_days.len() > active.len() + MAX_SESSION_DAY_CACHE_BINDINGS {
+            let victim = self.session_days.iter().filter(|(binding, _)| !active.contains(*binding))
+                .min_by_key(|(_, series)| series.last_used_tick)
+                .map(|(binding, _)| binding.clone());
+            let Some(victim) = victim else { break; };
+            self.session_days.remove(&victim);
+        }
     }
 
     pub fn apply(&mut self, envelope: MarketEnvelope) -> Result<ReduceOutcome, LocalMarketError> {
@@ -796,7 +1147,7 @@ impl LocalMarketStore {
         let outcome = reducer.apply(envelope.clone())?;
         for chart in self
             .chart_reducers
-            .values_mut()
+            .iter_mut()
             .filter(|chart| chart.view.selection == envelope.selection)
         {
             chart.apply(envelope.clone())?;
@@ -810,63 +1161,395 @@ impl LocalMarketStore {
         selection: &MarketSelection,
         config: ChartStudyConfig,
     ) -> Result<(), LocalMarketError> {
-        let replace = self
-            .chart_reducers
-            .get(key)
-            .is_none_or(|chart| &chart.view.selection != selection);
-        let base = if replace {
-            self.reducers.get(selection)
-        } else {
-            self.chart_reducers.get(key)
-        };
-        let Some(base) = base else {
-            self.chart_reducers.remove(key);
+        config.validate().map_err(LocalMarketError::Indicator)?;
+        let Some(base) = self.reducers.get(selection) else {
+            self.chart_bindings.remove(key);
+            self.prune_chart_reducers();
             return Ok(());
         };
-        if !replace && base.study_config == config {
-            return Ok(());
+        if base.study_config != config
+            && !self
+                .chart_reducers
+                .iter()
+                .any(|chart| &chart.view.selection == selection && chart.study_config == config)
+        {
+            let mut candidate = base.clone();
+            candidate.reconfigure_studies(config.clone())?;
+            self.chart_reducers.push(candidate);
         }
-        let mut candidate = base.clone();
-        candidate.reconfigure_studies(config)?;
-        self.chart_reducers.insert(key.to_owned(), candidate);
+        self.chart_bindings
+            .insert(key.to_owned(), (selection.clone(), config));
+        self.prune_chart_reducers();
         Ok(())
     }
 
+    pub fn retain_chart_keys(&mut self, keys: &BTreeSet<String>) {
+        self.chart_bindings.retain(|key, _| keys.contains(key));
+        self.prune_chart_reducers();
+    }
+
+    fn prune_chart_reducers(&mut self) {
+        self.chart_reducers.retain(|chart| {
+            self.chart_bindings.values().any(|(selection, config)| {
+                selection == &chart.view.selection && config == &chart.study_config
+            }) && self
+                .reducers
+                .get(&chart.view.selection)
+                .is_none_or(|base| base.study_config != chart.study_config)
+        });
+    }
+
     pub fn chart_view(&self, key: &str) -> Option<&LocalMarketView> {
-        self.chart_reducers.get(key).map(LocalMarketReducer::view)
+        let (selection, config) = self.chart_bindings.get(key)?;
+        self.reducers
+            .get(selection)
+            .filter(|base| &base.study_config == config)
+            .or_else(|| {
+                self.chart_reducers.iter().find(|chart| {
+                    &chart.view.selection == selection && &chart.study_config == config
+                })
+            })
+            .map(LocalMarketReducer::view)
     }
 
     pub fn view(&self, selection: &MarketSelection) -> Option<&LocalMarketView> {
         self.reducers.get(selection).map(LocalMarketReducer::view)
     }
 
-    pub fn view_for_symbol(&self, symbol: &str) -> Option<&LocalMarketView> {
-        self.reducers
-            .values()
-            .map(LocalMarketReducer::view)
-            .find(|view| view.selection.binding.symbol.to_string() == symbol)
+    pub(crate) fn base_minutes(&self, binding: &PublicMarketBinding) -> Option<(&[UiBar], &[BaseMinuteStudy], (u64, u64))> {
+        if !self.reducers.keys().any(|selection| &selection.binding == binding) { return None; }
+        self.base_minutes.get(binding).map(|series| (series.bars.as_slice(), series.studies.as_slice(), (series.incarnation, series.closed_revision)))
     }
 
-    pub fn latest_price_for_symbol(&self, symbol: &str) -> Option<(Decimal, u64, u64)> {
+    pub fn base_minute_facts(&self, binding: &PublicMarketBinding) -> Option<&[PublicBar]> {
+        if !self.reducers.keys().any(|selection| &selection.binding == binding) { return None; }
+        self.base_minutes.get(binding).map(|series| {
+            let end = series.facts.len().saturating_sub(usize::from(series.studies.last().is_some_and(|point| !point.confirmed)));
+            &series.facts[..end]
+        })
+    }
+
+    pub fn base_minute_forming_fact(&self, binding: &PublicMarketBinding) -> Option<&PublicBar> {
+        if !self.reducers.keys().any(|selection| &selection.binding == binding) { return None; }
+        self.base_minutes.get(binding).and_then(|series| {
+            series.studies.last().filter(|point| !point.confirmed)?;
+            series.facts.last()
+        })
+    }
+
+    pub fn session_days(&self, binding: &PublicMarketBinding) -> Option<&[PublicBar]> {
+        if !self.reducers.keys().any(|selection| &selection.binding == binding) { return None; }
+        self.session_days.get(binding).map(|series| series.bars.as_slice())
+    }
+
+    pub fn begin_shared_history(&mut self, binding: &PublicMarketBinding,
+        interval: ChartInterval, desired_start_ms: u64, desired_end_ms: u64) -> Option<SharedHistoryRequest> {
+        if !matches!(interval, ChartInterval::OneMinute | ChartInterval::OneDay)
+            || !self.reducers.keys().any(|selection| &selection.binding == binding) { return None; }
+        let first = match interval {
+            ChartInterval::OneMinute => {
+                let series = self.base_minutes.get(binding)?;
+                series.facts.first()?.open_time_ms
+            }
+            ChartInterval::OneDay => {
+                let series = self.session_days.get(binding)?;
+                if series.bars.len() >= 500 { return None; }
+                series.bars.first()?.open_time_ms
+            }
+            _ => return None,
+        };
+        let key = (binding.clone(), interval);
+        if self.shared_history_pending.contains_key(&key)
+            || self.shared_history_retry_after.get(&key).is_some_and(|until| *until > crate::account_center::now_ms())
+        { return None; }
+        let gap = if interval == ChartInterval::OneMinute && desired_start_ms < desired_end_ms {
+            self.base_minutes.get(binding).and_then(|series| {
+                series.gap_right_edges.range(desired_start_ms.saturating_add(1)..=desired_end_ms)
+                    .find_map(|right| {
+                        if self.shared_history_exhausted_at.contains(&(binding.clone(), interval, *right)) { return None; }
+                        let index = series.facts.binary_search_by_key(right, |bar| bar.open_time_ms).ok()?;
+                        let left = series.facts.get(index.checked_sub(1)?)?.open_time_ms;
+                        Some((*right, left))
+                    })
+            })
+        } else { None };
+        let (before, gap_after) = if let Some((right, left)) = gap { (right, Some(left)) }
+            else if desired_start_ms < first && first > 0
+                && (interval != ChartInterval::OneMinute
+                    || self.base_minutes.get(binding).is_some_and(|series| series.facts.len() < MAX_BASE_MINUTE_BARS))
+                && !self.shared_history_exhausted_at.contains(&(binding.clone(), interval, first))
+            { (first, None) } else { return None; };
+        self.next_shared_history_request_id = self.next_shared_history_request_id
+            .wrapping_add(1).max(1);
+        let request_id = self.next_shared_history_request_id;
+        self.shared_history_pending.insert(key, request_id);
+        Some(SharedHistoryRequest { request_id, generation: self.generation,
+            binding: binding.clone(), interval, before, gap_after })
+    }
+
+    pub fn cancel_shared_history(&mut self, request: &SharedHistoryRequest) {
+        let key = (request.binding.clone(), request.interval);
+        if request.generation == self.generation
+            && self.shared_history_pending.get(&key) == Some(&request.request_id) {
+            self.shared_history_pending.remove(&key);
+        }
+    }
+
+    pub fn retain_shared_history_demands(
+        &mut self, demanded: &BTreeSet<(PublicMarketBinding, ChartInterval)>) {
+        self.shared_history_pending.retain(|key, _| demanded.contains(key));
+        self.shared_history_retry_after.retain(|key, _| demanded.contains(key));
+    }
+
+    pub fn finish_shared_history(&mut self, request: &SharedHistoryRequest,
+        result: Result<Vec<PublicBar>, String>) -> Result<usize, LocalMarketError> {
+        if request.generation != self.generation { return Ok(0); }
+        let key = (request.binding.clone(), request.interval);
+        if self.shared_history_pending.get(&key) != Some(&request.request_id) { return Ok(0); }
+        self.shared_history_pending.remove(&key);
+        let bars = match result {
+            Ok(bars) => { self.shared_history_retry_after.remove(&key); bars }
+            Err(_) => {
+                self.shared_history_retry_after.insert(key, crate::account_center::now_ms().saturating_add(30_000));
+                return Ok(0);
+            }
+        };
+        if bars.len() > 500 || bars.iter().any(|bar| bar.open_time_ms >= request.before) {
+            self.shared_history_retry_after.insert(key,
+                crate::account_center::now_ms().saturating_add(30_000));
+            return Err(LocalMarketError::ScopeMismatch);
+        }
+        if bars.is_empty() {
+            self.shared_history_exhausted_at.insert((request.binding.clone(), request.interval, request.before));
+            return Ok(0);
+        }
+        if !history_page_covers_gap(&bars, request.before, request.gap_after) {
+            self.shared_history_exhausted_at.insert((request.binding.clone(), request.interval, request.before));
+            return Ok(0);
+        }
+        self.shared_history_exhausted_at.remove(&(request.binding.clone(), request.interval, request.before));
+        let added = bars.len();
+        let applied = match request.interval {
+            ChartInterval::OneMinute => self.apply_base_history(request.generation, request.binding.clone(), bars, None).map(|_| ()),
+            ChartInterval::OneDay => self.apply_session_history(request.generation, request.binding.clone(), bars, None).map(|_| ()),
+            _ => Err(LocalMarketError::ScopeMismatch),
+        };
+        if applied.is_err() {
+            self.shared_history_retry_after.insert(key,
+                crate::account_center::now_ms().saturating_add(30_000));
+        }
+        applied.map(|()| added)
+    }
+
+    pub fn apply_session_day(&mut self, generation: u64, binding: PublicMarketBinding,
+        bar: PublicBar, confirmed: bool) -> Result<ReduceOutcome, LocalMarketError> {
+        if generation < self.generation { return Ok(ReduceOutcome::IgnoredOldGeneration) }
+        if generation > self.generation { return Err(LocalMarketError::FutureGeneration) }
+        if !self.valid_session_scope(&binding, &bar) { return Err(LocalMarketError::ScopeMismatch) }
+        self.session_day_tick = self.session_day_tick.saturating_add(1);
+        let series = self.session_days.entry(binding).or_default();
+        series.last_used_tick = self.session_day_tick;
+        match series.bars.binary_search_by_key(&bar.open_time_ms, |day| day.open_time_ms) {
+            Ok(_index) if series.confirmed.contains(&bar.open_time_ms) && !confirmed => {}
+            Ok(index) if !confirmed && series.bars[index].received_at_ms > bar.received_at_ms => {}
+            Ok(index) => series.bars[index] = bar.clone(),
+            Err(index) => series.bars.insert(index, bar.clone()),
+        }
+        if confirmed { series.confirmed.insert(bar.open_time_ms); }
+        if series.bars.len() > 500 {
+            let expired = series.bars.drain(..series.bars.len()-500).map(|bar| bar.open_time_ms).collect::<Vec<_>>();
+            for time in expired { series.confirmed.remove(&time); }
+        }
+        Ok(ReduceOutcome::Applied)
+    }
+
+    pub fn apply_session_history(&mut self, generation: u64, binding: PublicMarketBinding,
+        bars: Vec<PublicBar>, forming: Option<PublicBar>) -> Result<ReduceOutcome, LocalMarketError> {
+        if generation < self.generation { return Ok(ReduceOutcome::IgnoredOldGeneration) }
+        if generation > self.generation { return Err(LocalMarketError::FutureGeneration) }
+        if bars.len() > 500 || bars.windows(2).any(|pair| pair[0].open_time_ms >= pair[1].open_time_ms)
+            || bars.iter().any(|bar| !self.valid_session_scope(&binding, bar))
+            || forming.as_ref().is_some_and(|bar| !self.valid_session_scope(&binding, bar))
+        { return Err(LocalMarketError::ScopeMismatch) }
+        for bar in bars { self.apply_session_day(generation, binding.clone(), bar, true)?; }
+        if let Some(bar) = forming { self.apply_session_day(generation, binding, bar, false)?; }
+        Ok(ReduceOutcome::Applied)
+    }
+
+    fn valid_session_scope(&self, binding: &PublicMarketBinding, bar: &PublicBar) -> bool {
+        self.reducers.keys().any(|selection| &selection.binding == binding)
+            && bar.symbol == binding.symbol && bar.generation == self.generation
+            && bar.interval_ms == 86_400_000 && bar.is_valid()
+    }
+
+    pub fn apply_base_minute(&mut self, generation: u64, binding: PublicMarketBinding,
+        bar: PublicBar, confirmed: bool) -> Result<ReduceOutcome, LocalMarketError> {
+        if generation < self.generation { return Ok(ReduceOutcome::IgnoredOldGeneration) }
+        if generation > self.generation { return Err(LocalMarketError::FutureGeneration) }
+        if !self.valid_base_scope(generation, &binding, &bar) {
+            return Err(LocalMarketError::ScopeMismatch);
+        }
+        self.base_minute_tick = self.base_minute_tick.saturating_add(1);
+        let tick = self.base_minute_tick;
+        let series = self.base_minutes.entry(binding.clone()).or_default();
+        if series.incarnation == 0 { series.incarnation = tick; }
+        let newly_narrowed_gap = series.facts.binary_search_by_key(&bar.open_time_ms,
+            |known| known.open_time_ms).err().and_then(|index| {
+                let left = series.facts.get(index.checked_sub(1)?)?.open_time_ms;
+                let right = series.facts.get(index)?.open_time_ms;
+                (left.saturating_add(60_000) < right).then_some(right)
+            });
+        series.insert(bar, confirmed)?;
+        series.last_used_tick = tick;
+        if let Some(right) = newly_narrowed_gap {
+            self.shared_history_exhausted_at.remove(&(binding.clone(), ChartInterval::OneMinute, right));
+        }
+        self.trim_base_minute_cache(&binding, MAX_BASE_MINUTE_CACHE_BYTES);
+        Ok(ReduceOutcome::Applied)
+    }
+
+    pub fn apply_base_history(&mut self, generation: u64, binding: PublicMarketBinding,
+        bars: Vec<PublicBar>, forming: Option<PublicBar>) -> Result<ReduceOutcome, LocalMarketError> {
+        if generation < self.generation { return Ok(ReduceOutcome::IgnoredOldGeneration) }
+        if generation > self.generation { return Err(LocalMarketError::FutureGeneration) }
+        if bars.len() > 1_500 || bars.windows(2).any(|pair| pair[0].open_time_ms >= pair[1].open_time_ms)
+            || bars.iter().any(|bar| !self.valid_base_scope(generation, &binding, bar))
+            || forming.as_ref().is_some_and(|bar| !self.valid_base_scope(generation, &binding, bar))
+        {
+            return Err(LocalMarketError::ScopeMismatch);
+        }
+        let prepared = bars.into_iter().map(|bar| BaseMinuteSeries::prepare(bar, true))
+            .collect::<Result<Vec<_>, _>>()?;
+        let prepared_forming = forming.map(|bar| BaseMinuteSeries::prepare(bar, false)).transpose()?;
+        self.base_minute_tick = self.base_minute_tick.saturating_add(1);
+        let tick = self.base_minute_tick;
+        let prefix_page = prepared_forming.is_none() && !prepared.is_empty() && self.base_minutes.get(&binding)
+            .and_then(|series| series.facts.first())
+            .is_some_and(|first| prepared.last().is_some_and(|(last, _, _)| last.open_time_ms < first.open_time_ms));
+        if prefix_page {
+            let mut prefix = BaseMinuteSeries::default();
+            for (bar, ui_bar, point) in prepared { prefix.insert_prepared(bar, ui_bar, point); }
+            // Validate the new page before taking ownership of the cached tail.
+            // Repeated 1m paging must not clone the entire growing series.
+            let mut candidate = self.base_minutes.remove(&binding).unwrap_or_default();
+            prefix.bars.append(&mut candidate.bars);
+            prefix.studies.append(&mut candidate.studies);
+            if let (Some(left), Some(right)) = (prefix.facts.last(), candidate.facts.first()) {
+                if left.open_time_ms.saturating_add(60_000) < right.open_time_ms {
+                    prefix.gap_right_edges.insert(right.open_time_ms);
+                }
+            }
+            prefix.gap_right_edges.append(&mut candidate.gap_right_edges);
+            prefix.facts.append(&mut candidate.facts);
+            prefix.closed_revision = candidate.closed_revision.saturating_add(1);
+            prefix.incarnation = if candidate.incarnation == 0 { tick } else { candidate.incarnation };
+            prefix.last_used_tick = tick;
+            if prefix.facts.len() > MAX_BASE_MINUTE_BARS {
+                let extra = prefix.facts.len() - MAX_BASE_MINUTE_BARS;
+                prefix.bars.drain(..extra);
+                prefix.studies.drain(..extra);
+                prefix.facts.drain(..extra);
+                if let Some(first) = prefix.facts.first() {
+                    prefix.gap_right_edges.retain(|right| *right > first.open_time_ms);
+                }
+            }
+            self.base_minutes.insert(binding.clone(), prefix);
+        } else {
+            let candidate = self.base_minutes.entry(binding.clone()).or_default();
+            if candidate.incarnation == 0 { candidate.incarnation = tick; }
+            for (bar, ui_bar, point) in prepared { candidate.insert_prepared(bar, ui_bar, point); }
+            if let Some((bar, ui_bar, point)) = prepared_forming {
+                candidate.insert_prepared(bar, ui_bar, point);
+            }
+            candidate.last_used_tick = tick;
+        }
+        self.trim_base_minute_cache(&binding, MAX_BASE_MINUTE_CACHE_BYTES);
+        Ok(ReduceOutcome::Applied)
+    }
+
+    fn trim_base_minute_cache(&mut self, protected: &PublicMarketBinding, budget: usize) {
+        let mut used = self.base_minutes.values().map(BaseMinuteSeries::memory_bytes).sum::<usize>();
+        if used > budget {
+            if let Some(series) = self.base_minutes.get_mut(protected) {
+                let reclaimable = (series.bars.capacity() - series.bars.len())
+                    * std::mem::size_of::<UiBar>()
+                    + (series.studies.capacity() - series.studies.len())
+                        * std::mem::size_of::<BaseMinuteStudy>()
+                    + (series.facts.capacity() - series.facts.len())
+                        * std::mem::size_of::<PublicBar>();
+                if used.saturating_sub(reclaimable) <= budget {
+                    let before = series.memory_bytes();
+                    series.bars.shrink_to_fit();
+                    series.studies.shrink_to_fit();
+                    series.facts.shrink_to_fit();
+                    used = used.saturating_sub(before).saturating_add(series.memory_bytes());
+                }
+            }
+        }
+        while used > budget {
+            let victim = self.base_minutes.iter()
+                .filter(|(binding, _)| *binding != protected)
+                .min_by_key(|(_, series)| series.last_used_tick)
+                .map(|(binding, _)| binding.clone());
+            let Some(victim) = victim else {
+                // Keep the active source intact; only release unused vector capacity.
+                if let Some(series) = self.base_minutes.get_mut(protected) {
+                    series.bars.shrink_to_fit();
+                    series.studies.shrink_to_fit();
+                    series.facts.shrink_to_fit();
+                }
+                break;
+            };
+            if let Some(removed) = self.base_minutes.remove(&victim) {
+                used = used.saturating_sub(removed.memory_bytes());
+                self.shared_history_pending.remove(&(victim.clone(), ChartInterval::OneMinute));
+                self.shared_history_retry_after.remove(&(victim.clone(), ChartInterval::OneMinute));
+                self.shared_history_exhausted_at.retain(|(binding, interval, _)|
+                    binding != &victim || *interval != ChartInterval::OneMinute);
+            }
+        }
+    }
+
+    fn valid_base_scope(&self, generation: u64, binding: &PublicMarketBinding, bar: &PublicBar) -> bool {
+        self.reducers.keys().any(|selection| &selection.binding == binding)
+            && bar.symbol == binding.symbol && bar.generation == generation
+            && bar.interval_ms == 60_000 && bar.is_valid()
+    }
+
+    pub fn view_for_symbol(&self, symbol: &str) -> Option<&LocalMarketView> {
+        let (base, quote) = symbol.split_once('/')?;
         self.reducers
             .values()
             .map(LocalMarketReducer::view)
-            .filter(|view| view.selection.binding.symbol.to_string() == symbol)
-            .filter_map(|view| {
-                Some((
-                    view.last?,
-                    view.last_price_event_ms?,
-                    view.last_price_received_ms?,
-                ))
+            .find(|view| {
+                view.selection.binding.symbol.base() == base
+                    && view.selection.binding.symbol.quote() == quote
             })
-            .max_by_key(|(_, event_ms, received_ms)| (*event_ms, *received_ms))
+    }
+
+    pub(crate) fn views_for_market(
+        &self,
+        venue: venue_gateway_api::VenueId,
+        symbol: &str,
+    ) -> impl Iterator<Item = &LocalMarketView> {
+        let parts = symbol.split_once('/');
+        self.reducers
+            .values()
+            .map(LocalMarketReducer::view)
+            .filter(move |view| {
+                view.selection.binding.venue == venue
+                    && parts.is_some_and(|(base, quote)| {
+                        view.selection.binding.symbol.base() == base
+                            && view.selection.binding.symbol.quote() == quote
+                    })
+            })
     }
 
     pub fn refresh_staleness(&mut self, now_ms: u64, stale_after_ms: u64) {
         for reducer in self.reducers.values_mut() {
             reducer.refresh_staleness(now_ms, stale_after_ms);
         }
-        for reducer in self.chart_reducers.values_mut() {
+        for reducer in &mut self.chart_reducers {
             reducer.refresh_staleness(now_ms, stale_after_ms);
         }
     }
@@ -881,10 +1564,19 @@ impl LocalMarketStore {
         if self.study_config == study_config {
             return Ok(());
         }
+        // A chart keeps its explicit configuration when the default engine changes.
+        for reducer in self.reducers.values() {
+            if self.chart_bindings.values().any(|(selection, config)| {
+                selection == &reducer.view.selection && config == &reducer.study_config
+            }) {
+                self.chart_reducers.push(reducer.clone());
+            }
+        }
         for reducer in self.reducers.values_mut() {
             reducer.reconfigure_studies(study_config.clone())?;
         }
         self.study_config = study_config;
+        self.prune_chart_reducers();
         Ok(())
     }
 }
@@ -922,9 +1614,10 @@ pub enum LocalMarketError {
 fn validate_study_bar(
     bar: &PublicBar,
     selection: &MarketSelection,
+    generation: u64,
 ) -> Result<(), LocalMarketError> {
     if bar.symbol != selection.binding.symbol
-        || bar.generation == 0
+        || bar.generation != generation
         || bar.interval_ms != selection.interval.duration_ms()
         || !bar.is_valid()
     {
@@ -942,16 +1635,17 @@ fn apply_print_to_bar(bar: &mut PublicBar, price: Decimal) -> Result<(), LocalMa
 }
 
 fn ui_bar_from_public(bar: &PublicBar) -> Result<UiBar, LocalMarketError> {
-    let FieldState::Known(volume) = bar.base_volume else {
-        return Err(LocalMarketError::InvalidBar);
-    };
     Ok(UiBar {
         open_time_ms: bar.open_time_ms,
         open: bar.open.value(),
         high: bar.high.value(),
         low: bar.low.value(),
         close: bar.close.value(),
-        volume,
+        volume: match bar.base_volume {
+            FieldState::Known(volume) => Some(volume),
+            FieldState::Unavailable { .. } => None,
+            _ => return Err(LocalMarketError::InvalidBar),
+        },
     })
 }
 
@@ -981,6 +1675,9 @@ fn study_point(values: ChartStudyValues) -> ChartStudyPoint {
     });
     ChartStudyPoint {
         custom_ema_adx: values.custom_ema_adx,
+        custom_scripts: values.custom_scripts,
+        order_flow: values.order_flow,
+        bar_vwap: values.bar_vwap,
         sma: values.sma,
         sma_second: common.sma_extra.second,
         sma_third: common.sma_extra.third,
@@ -1028,7 +1725,7 @@ fn validate_bar(bar: &UiBar, interval: ChartInterval) -> Result<(), LocalMarketE
         && bar.high > Decimal::ZERO
         && bar.low > Decimal::ZERO
         && bar.close > Decimal::ZERO
-        && bar.volume >= Decimal::ZERO;
+        && bar.volume.is_none_or(|volume| volume >= Decimal::ZERO);
     let bounds = bar.low <= bar.open
         && bar.low <= bar.close
         && bar.high >= bar.open
@@ -1099,718 +1796,9 @@ fn normalize_book_side(
 }
 
 #[cfg(test)]
-mod tests {
-    mod live_studies;
-    #[test]
-    fn rtt_expires_without_making_market_data_fresh() -> Result<(), super::LocalMarketError> {
-        let mut reducer = super::LocalMarketReducer::new(selection("BTC/USDT")?)?;
-        let old = std::time::Instant::now() - std::time::Duration::from_secs(46);
-        reducer.apply(envelope(
-            &reducer,
-            0,
-            super::MarketPayload::ConnectionRtt {
-                millis: 120,
-                measured_at: old,
-            },
-        ))?;
-        assert_eq!(reducer.view().recent_rtt_ms(), None);
-        assert_eq!(reducer.view().last_received_ms, None);
-        let sample = envelope(
-            &reducer,
-            0,
-            super::MarketPayload::ConnectionRtt {
-                millis: 1500,
-                measured_at: std::time::Instant::now(),
-            },
-        );
-        reducer.apply(sample)?;
-        assert_eq!(reducer.view().recent_rtt_ms(), Some(1500));
-        assert_eq!(reducer.view().last_received_ms, None);
-        Ok(())
-    }
-    use super::*;
-    use venue_control_protocol::AggressorSide;
-    use venue_domain::Price;
+#[path = "market/tests.rs"]
+mod tests;
 
-    fn selection(symbol: &str) -> Result<MarketSelection, LocalMarketError> {
-        MarketSelection::binance_usd_m(symbol, ChartInterval::OneMinute)
-    }
-
-    #[test]
-    fn pnl_price_freshness_only_advances_with_new_prices() -> Result<(), LocalMarketError> {
-        let mut reducer = LocalMarketReducer::new(selection("BTC/USDT")?)?;
-        reducer.apply(envelope(
-            &reducer,
-            100,
-            MarketPayload::Trade(UiTrade {
-                trade_id: "first".into(),
-                occurred_ms: 100,
-                price: Decimal::from(100),
-                quantity: Decimal::ONE,
-                aggressor: AggressorSide::Buy,
-            }),
-        ))?;
-        for payload in [
-            MarketPayload::Bbo {
-                bid: Decimal::from(99),
-                ask: Decimal::from(101),
-            },
-            MarketPayload::Status {
-                status: MarketStatus::Live,
-                detail: None,
-            },
-            MarketPayload::Trade(UiTrade {
-                trade_id: "late".into(),
-                occurred_ms: 90,
-                price: Decimal::from(90),
-                quantity: Decimal::ONE,
-                aggressor: AggressorSide::Buy,
-            }),
-        ] {
-            reducer.apply(envelope(&reducer, 20_000, payload))?;
-            assert_eq!(reducer.view().last, Some(Decimal::from(100)));
-            assert_eq!(reducer.view().last_price_event_ms, Some(100));
-            assert_eq!(reducer.view().last_price_received_ms, Some(107));
-        }
-        reducer.select(selection("ETH/USDT")?)?;
-        assert_eq!(reducer.view().last_price_event_ms, None);
-        assert_eq!(reducer.view().last_price_received_ms, None);
-        Ok(())
-    }
-
-    fn bar(open_time_ms: u64, close: i64) -> UiBar {
-        UiBar {
-            open_time_ms,
-            open: Decimal::new(close - 1, 0),
-            high: Decimal::new(close + 1, 0),
-            low: Decimal::new(close - 2, 0),
-            close: Decimal::new(close, 0),
-            volume: Decimal::new(10, 0),
-        }
-    }
-
-    fn study_bar(open_time_ms: u64, close: i64) -> Result<PublicBar, LocalMarketError> {
-        let ui = bar(open_time_ms, close);
-        let price = |value| Price::new(value).map_err(|_| LocalMarketError::InvalidBar);
-        Ok(PublicBar {
-            symbol: "BTC/USDT"
-                .parse()
-                .map_err(|_| LocalMarketError::InvalidSymbol)?,
-            generation: 1,
-            received_at_ms: open_time_ms + 60_000,
-            sequence: open_time_ms / 60_000,
-            open_time_ms,
-            close_time_ms: open_time_ms + 59_999,
-            interval_ms: 60_000,
-            open: price(ui.open)?,
-            high: price(ui.high)?,
-            low: price(ui.low)?,
-            close: price(ui.close)?,
-            base_volume: FieldState::Known(ui.volume),
-            quote_volume: FieldState::Known(ui.volume * ui.close),
-            trade_count: FieldState::Known(1),
-            taker_buy_base_volume: FieldState::Known(Decimal::ZERO),
-            taker_buy_quote_volume: FieldState::Known(Decimal::ZERO),
-        })
-    }
-
-    fn envelope(
-        reducer: &LocalMarketReducer,
-        event_time_ms: u64,
-        payload: MarketPayload,
-    ) -> MarketEnvelope {
-        MarketEnvelope {
-            generation: reducer.view().generation,
-            selection: reducer.view().selection.clone(),
-            event_time_ms,
-            received_ms: event_time_ms + 7,
-            payload,
-        }
-    }
-
-    #[test]
-    fn selection_is_fixed_to_canonical_binance_usd_m() -> Result<(), LocalMarketError> {
-        assert_eq!(
-            selection("BTC/USDT")?.binding.symbol.to_string(),
-            "BTC/USDT"
-        );
-        assert_eq!(
-            selection("ETH/USDC")?.binding.symbol.to_string(),
-            "ETH/USDC"
-        );
-        assert_eq!(selection("btcusdt"), Err(LocalMarketError::InvalidSymbol));
-        assert_eq!(selection("BTC/USD"), Err(LocalMarketError::InvalidBinding));
-        Ok(())
-    }
-
-    #[test]
-    fn live_prints_update_candle_shape_color_and_price_together() -> Result<(), LocalMarketError> {
-        let mut reducer = LocalMarketReducer::new(selection("BTC/USDT")?)?;
-        reducer.apply(envelope(
-            &reducer,
-            120_000,
-            MarketPayload::RestHistory {
-                bars: vec![study_bar(60_000, 100)?],
-            },
-        ))?;
-        let forming = study_bar(120_000, 101)?;
-        reducer.apply(envelope(
-            &reducer,
-            120_100,
-            MarketPayload::WsBar {
-                bar: ui_bar_from_public(&forming)?,
-                study_bar: Box::new(forming.clone()),
-                closed: false,
-            },
-        ))?;
-        let before = reducer.view().bars[0].clone();
-        for (time, price) in [(120_200, 105), (120_300, 95)] {
-            reducer.apply(envelope(
-                &reducer,
-                time,
-                MarketPayload::Trade(UiTrade {
-                    trade_id: time.to_string(),
-                    occurred_ms: time,
-                    price: Decimal::from(price),
-                    quantity: Decimal::ONE,
-                    aggressor: AggressorSide::Buy,
-                }),
-            ))?;
-            let candle = &reducer.view().bars[1];
-            assert_eq!(candle.close, Decimal::from(price));
-            assert_eq!(reducer.view().last, Some(candle.close));
-            assert_eq!(candle.close >= candle.open, price > 100);
-            assert_eq!(candle.high, Decimal::from(105));
-            assert_eq!(candle.volume, Decimal::from(10));
-            assert_eq!(reducer.view().bars[0], before);
-        }
-        assert_eq!(reducer.view().bars[1].low, Decimal::from(95));
-        // A lagging kline must not revert a newer trade, body or wick.
-        reducer.apply(envelope(
-            &reducer,
-            120_150,
-            MarketPayload::WsBar {
-                bar: ui_bar_from_public(&forming)?,
-                study_bar: Box::new(forming),
-                closed: false,
-            },
-        ))?;
-        assert_eq!(reducer.view().bars[1].close, Decimal::from(95));
-        assert_eq!(reducer.view().bars[1].high, Decimal::from(105));
-        reducer.apply(envelope(
-            &reducer,
-            120_310,
-            MarketPayload::Trade(UiTrade {
-                trade_id: "late".into(),
-                occurred_ms: 120_250,
-                price: Decimal::from(104),
-                quantity: Decimal::ONE,
-                aggressor: AggressorSide::Buy,
-            }),
-        ))?;
-        assert_eq!(reducer.view().last, Some(Decimal::from(95)));
-        assert_eq!(reducer.view().bars[1].close, Decimal::from(95));
-        Ok(())
-    }
-
-    #[test]
-    fn switching_generation_clears_state_and_ignores_old_results() -> Result<(), LocalMarketError> {
-        let mut reducer = LocalMarketReducer::new(selection("BTC/USDT")?)?;
-        let old = envelope(
-            &reducer,
-            120_000,
-            MarketPayload::RestHistory {
-                bars: vec![study_bar(60_000, 10)?],
-            },
-        );
-        reducer.apply(old.clone())?;
-        let generation = reducer.select(MarketSelection::binance_usd_m(
-            "ETH/USDT",
-            ChartInterval::FiveMinutes,
-        )?)?;
-
-        assert_eq!(generation, 2);
-        assert!(reducer.view().bars.is_empty());
-        assert_eq!(reducer.apply(old)?, ReduceOutcome::IgnoredOldGeneration);
-        assert_eq!(
-            reducer.view().selection.binding.symbol.to_string(),
-            "ETH/USDT"
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn cached_chart_is_bounded_preview_only_and_never_live_state() -> Result<(), LocalMarketError> {
-        let mut store = LocalMarketStore::default();
-        let first = selection("BTC/USDT")?;
-        store.replace([first.clone()])?;
-        let old = MarketEnvelope {
-            generation: store.generation(),
-            selection: first.clone(),
-            event_time_ms: 120_000,
-            received_ms: 120_000,
-            payload: MarketPayload::RestHistory {
-                bars: vec![study_bar(60_000, 10)?],
-            },
-        };
-        store.apply(old.clone())?;
-        let other = MarketSelection::binance_usd_m("BTC/USDT", ChartInterval::FiveMinutes)?;
-        store.replace([other.clone()])?;
-        assert!(store.chart_preview(&other).is_none());
-        assert_eq!(store.chart_preview(&first).map(<[UiBar]>::len), Some(1));
-        store.replace([first.clone()])?;
-        assert!(store.view(&first).unwrap().bars.is_empty());
-        assert!(store.view(&first).unwrap().last.is_none());
-        assert_eq!(store.apply(old)?, ReduceOutcome::IgnoredOldGeneration);
-        for index in 0..12 {
-            let next = selection(&format!("COIN{index}/USDT"))?;
-            store.replace([next.clone()])?;
-            // Public adapter output is already validated by the reducer in production.
-            store.reducers.get_mut(&next).unwrap().view.bars = vec![UiBar {
-                open_time_ms: 60_000,
-                open: 1.into(),
-                high: 1.into(),
-                low: 1.into(),
-                close: 1.into(),
-                volume: 1.into(),
-            }];
-        }
-        assert_eq!(store.chart_previews.len(), 8);
-        store.replace([])?;
-        assert!(store.chart_previews.is_empty());
-        Ok(())
-    }
-
-    #[test]
-    fn rejects_current_generation_with_wrong_scope() -> Result<(), LocalMarketError> {
-        let mut reducer = LocalMarketReducer::new(selection("BTC/USDT")?)?;
-        let mut result = envelope(
-            &reducer,
-            120_000,
-            MarketPayload::Status {
-                status: MarketStatus::Live,
-                detail: None,
-            },
-        );
-        result.selection = selection("ETH/USDT")?;
-        assert_eq!(reducer.apply(result), Err(LocalMarketError::ScopeMismatch));
-        Ok(())
-    }
-
-    #[test]
-    fn history_and_tail_upsert_are_sorted_and_closed_never_regresses()
-    -> Result<(), LocalMarketError> {
-        let mut reducer = LocalMarketReducer::new(selection("BTC/USDT")?)?;
-        let history = envelope(
-            &reducer,
-            180_000,
-            MarketPayload::RestHistory {
-                bars: vec![study_bar(120_000, 12)?, study_bar(60_000, 11)?],
-            },
-        );
-        reducer.apply(history)?;
-        let closed_update = envelope(
-            &reducer,
-            181_000,
-            MarketPayload::WsBar {
-                bar: bar(120_000, 13),
-                study_bar: Box::new(study_bar(120_000, 13)?),
-                closed: true,
-            },
-        );
-        reducer.apply(closed_update)?;
-        let regressing_update = envelope(
-            &reducer,
-            182_000,
-            MarketPayload::WsBar {
-                bar: bar(120_000, 99),
-                study_bar: Box::new(study_bar(120_000, 99)?),
-                closed: false,
-            },
-        );
-        reducer.apply(regressing_update)?;
-
-        assert_eq!(reducer.view().bars[0].open_time_ms, 60_000);
-        assert_eq!(reducer.view().bars[1].close, Decimal::new(13, 0));
-        assert_eq!(reducer.view().last, Some(Decimal::new(13, 0)));
-        Ok(())
-    }
-
-    #[test]
-    fn indicator_reconfiguration_rebuilds_closed_history_without_resubscribing()
-    -> Result<(), LocalMarketError> {
-        let mut reducer = LocalMarketReducer::new(selection("BTC/USDT")?)?;
-        let bars = (1_u64..=5)
-            .map(|index| study_bar(index * 60_000, 100 + index as i64))
-            .collect::<Result<Vec<_>, _>>()?;
-        let history = envelope(&reducer, 360_000, MarketPayload::RestHistory { bars });
-        reducer.apply(history)?;
-        let generation = reducer.view().generation;
-        assert!(
-            reducer
-                .view()
-                .studies
-                .last()
-                .is_some_and(|point| point.sma.is_none())
-        );
-
-        let configuration = ChartStudyConfig {
-            sma_period: 2,
-            ..ChartStudyConfig::default()
-        };
-        reducer.reconfigure_studies(configuration)?;
-
-        assert_eq!(reducer.view().generation, generation);
-        assert_eq!(reducer.view().bars.len(), 5);
-        assert!(
-            reducer
-                .view()
-                .studies
-                .last()
-                .is_some_and(|point| point.sma.is_some())
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn bars_and_recompute_facts_are_bounded() -> Result<(), LocalMarketError> {
-        let mut reducer = LocalMarketReducer::new(selection("BTC/USDT")?)?;
-        let bars = (1_u64..=MAX_BARS as u64 + 10)
-            .map(|index| study_bar(index * 60_000, 10))
-            .collect::<Result<Vec<_>, _>>()?;
-        let result = envelope(
-            &reducer,
-            (MAX_BARS as u64 + 11) * 60_000,
-            MarketPayload::RestHistory { bars },
-        );
-        reducer.apply(result)?;
-        assert_eq!(reducer.view().bars.len(), MAX_BARS);
-        assert_eq!(reducer.view().bars[0].open_time_ms, 11 * 60_000);
-        Ok(())
-    }
-
-    #[test]
-    fn forming_bar_survives_reconfiguration_and_history_prepend() -> Result<(), LocalMarketError> {
-        let selected = selection("BTC/USDT")?;
-        let mut store = LocalMarketStore::default();
-        store.replace([selected.clone()])?;
-        let history = MarketEnvelope {
-            generation: store.generation(),
-            selection: selected.clone(),
-            event_time_ms: 420_000,
-            received_ms: 420_000,
-            payload: MarketPayload::RestHistory {
-                bars: (4..=6)
-                    .map(|i| study_bar(i * 60_000, 100 + i as i64))
-                    .collect::<Result<Vec<_>, _>>()?,
-            },
-        };
-        store.apply(history)?;
-        let forming = study_bar(420_000, 150)?;
-        store.apply(MarketEnvelope {
-            generation: store.generation(),
-            selection: selected.clone(),
-            event_time_ms: 421_000,
-            received_ms: 421_000,
-            payload: MarketPayload::WsBar {
-                bar: ui_bar_from_public(&forming)?,
-                study_bar: Box::new(forming),
-                closed: false,
-            },
-        })?;
-        let fast = ChartStudyConfig {
-            sma_period: 2,
-            custom_ema_adx: Some(venue_indicators::chart::EmaAdxConfig::default()),
-            ..Default::default()
-        };
-        let slow = ChartStudyConfig {
-            sma_period: 5,
-            ..Default::default()
-        };
-        store.configure_chart("fast", &selected, fast)?;
-        store.configure_chart("slow", &selected, slow)?;
-        let fast = store
-            .chart_view("fast")
-            .ok_or(LocalMarketError::ScopeMismatch)?;
-        assert_eq!(fast.bars.len(), 4);
-        assert!(fast.studies.iter().all(|p| p.custom_ema_adx.is_some()));
-        assert!(
-            store
-                .chart_view("slow")
-                .is_some_and(|v| v.studies.iter().all(|p| p.custom_ema_adx.is_none()))
-        );
-        assert!(
-            !fast
-                .studies
-                .last()
-                .ok_or(LocalMarketError::InvalidBar)?
-                .confirmed
-        );
-        assert!(
-            fast.studies
-                .last()
-                .ok_or(LocalMarketError::InvalidBar)?
-                .sma
-                .is_some()
-        );
-        assert!(
-            store
-                .chart_view("slow")
-                .and_then(|v| v.studies.last())
-                .is_some_and(|v| v.sma.is_none())
-        );
-        let request = store
-            .begin_history(&selected, false)
-            .ok_or(LocalMarketError::InvalidBar)?;
-        assert!(store.begin_history(&selected, false).is_none());
-        assert_eq!(
-            store.finish_history(
-                &request,
-                Ok((1..=3)
-                    .map(|i| study_bar(i * 60_000, 100 + i as i64))
-                    .collect::<Result<Vec<_>, _>>()?)
-            )?,
-            3
-        );
-        let chart = store
-            .chart_view("slow")
-            .ok_or(LocalMarketError::ScopeMismatch)?;
-        assert_eq!(chart.bars.len(), 7);
-        assert_eq!(
-            chart.bars.last().map(|bar| bar.close),
-            Some(Decimal::new(150, 0))
-        );
-        assert!(
-            !chart
-                .studies
-                .last()
-                .ok_or(LocalMarketError::InvalidBar)?
-                .confirmed
-        );
-        assert!(
-            chart
-                .studies
-                .last()
-                .ok_or(LocalMarketError::InvalidBar)?
-                .sma
-                .is_some()
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn old_or_discontinuous_history_cannot_overwrite_current_chart() -> Result<(), LocalMarketError>
-    {
-        let selected = selection("BTC/USDT")?;
-        let mut store = LocalMarketStore::default();
-        store.replace([selected.clone()])?;
-        store.apply(MarketEnvelope {
-            generation: store.generation(),
-            selection: selected.clone(),
-            event_time_ms: 240_000,
-            received_ms: 240_000,
-            payload: MarketPayload::RestHistory {
-                bars: vec![study_bar(180_000, 100)?],
-            },
-        })?;
-        let request = store
-            .begin_history(&selected, false)
-            .ok_or(LocalMarketError::InvalidBar)?;
-        assert!(
-            store
-                .finish_history(&request, Ok(vec![study_bar(60_000, 99)?]))
-                .is_err()
-        );
-        assert_eq!(store.view(&selected).map(|v| v.bars.len()), Some(1));
-        store.replace([selection("ETH/USDT")?])?;
-        assert_eq!(
-            store.finish_history(&request, Ok(vec![study_bar(120_000, 99)?]))?,
-            0
-        );
-        assert!(store.view(&selected).is_none());
-        Ok(())
-    }
-
-    #[test]
-    fn book_is_deduplicated_sorted_and_bounded() -> Result<(), LocalMarketError> {
-        let mut reducer = LocalMarketReducer::new(selection("BTC/USDT")?)?;
-        let bids = (1_i64..=25)
-            .map(|price| UiBookLevel {
-                price: Decimal::new(price, 0),
-                quantity: Decimal::new(price, 0),
-            })
-            .chain(std::iter::once(UiBookLevel {
-                price: Decimal::new(25, 0),
-                quantity: Decimal::new(99, 0),
-            }))
-            .collect();
-        let asks = (30_i64..=55)
-            .map(|price| UiBookLevel {
-                price: Decimal::new(price, 0),
-                quantity: Decimal::new(1, 0),
-            })
-            .collect();
-        let result = envelope(&reducer, 60_000, MarketPayload::BookSnapshot { bids, asks });
-        reducer.apply(result)?;
-        assert_eq!(reducer.view().bids.len(), MAX_BOOK_LEVELS);
-        assert_eq!(reducer.view().asks.len(), MAX_BOOK_LEVELS);
-        assert_eq!(reducer.view().bids[0].price, Decimal::new(25, 0));
-        assert_eq!(reducer.view().bids[0].quantity, Decimal::new(99, 0));
-        assert_eq!(reducer.view().asks[0].price, Decimal::new(30, 0));
-        assert_eq!(reducer.view().bid, Some(Decimal::new(25, 0)));
-        assert_eq!(reducer.view().ask, Some(Decimal::new(30, 0)));
-        Ok(())
-    }
-
-    #[test]
-    fn trades_are_deduplicated_sorted_and_bounded() -> Result<(), LocalMarketError> {
-        let mut reducer = LocalMarketReducer::new(selection("BTC/USDT")?)?;
-        for index in (1_u64..=205).rev() {
-            let result = envelope(
-                &reducer,
-                index,
-                MarketPayload::Trade(UiTrade {
-                    trade_id: format!("trade-{index:03}"),
-                    occurred_ms: index,
-                    price: Decimal::new(10, 0),
-                    quantity: Decimal::new(1, 0),
-                    aggressor: AggressorSide::Buy,
-                }),
-            );
-            reducer.apply(result)?;
-        }
-        let duplicate = envelope(
-            &reducer,
-            205,
-            MarketPayload::Trade(reducer.view().trades[0].clone()),
-        );
-        reducer.apply(duplicate)?;
-
-        assert_eq!(reducer.view().trades.len(), MAX_TRADES);
-        assert_eq!(reducer.view().trades[0].occurred_ms, 6);
-        assert_eq!(reducer.view().trades[199].occurred_ms, 205);
-        Ok(())
-    }
-
-    #[test]
-    fn tracks_latency_and_marks_live_feed_stale() -> Result<(), LocalMarketError> {
-        let mut reducer = LocalMarketReducer::new(selection("BTC/USDT")?)?;
-        let live = envelope(
-            &reducer,
-            1_000,
-            MarketPayload::Status {
-                status: MarketStatus::Live,
-                detail: None,
-            },
-        );
-        reducer.apply(live)?;
-        assert_eq!(reducer.view().latency_ms, None);
-        reducer.apply(envelope(
-            &reducer,
-            1_001,
-            MarketPayload::Bbo {
-                bid: Decimal::ONE,
-                ask: Decimal::new(2, 0),
-            },
-        ))?;
-        assert_eq!(reducer.view().latency_ms, Some(7));
-        let received = reducer.view().last_received_ms;
-        reducer.apply(envelope(
-            &reducer,
-            5_999,
-            MarketPayload::ConnectionRtt {
-                millis: 1501,
-                measured_at: std::time::Instant::now(),
-            },
-        ))?;
-        assert_eq!(reducer.view().connection_rtt_ms, Some(1501));
-        assert_eq!(reducer.view().last_received_ms, received);
-        assert_eq!(reducer.view().latency_ms, Some(7));
-        reducer.apply(envelope(
-            &reducer,
-            1_002,
-            MarketPayload::Status {
-                status: MarketStatus::Live,
-                detail: None,
-            },
-        ))?;
-        assert_eq!(reducer.view().latency_ms, Some(7));
-        reducer.refresh_staleness(6_010, 5_000);
-        assert_eq!(reducer.view().status, MarketStatus::Stale);
-        assert_eq!(
-            reducer.view().status_detail.as_deref(),
-            Some("market event timeout")
-        );
-        reducer.apply(envelope(
-            &reducer,
-            6_011,
-            MarketPayload::Bbo {
-                bid: Decimal::ONE,
-                ask: Decimal::new(2, 0),
-            },
-        ))?;
-        assert_eq!(reducer.view().status, MarketStatus::Live);
-        assert!(reducer.view().status_detail.is_none());
-        assert!(reducer.view().last_price_received_ms.is_none());
-        let received = reducer.view().last_received_ms;
-        reducer.apply(envelope(
-            &reducer,
-            10_000,
-            MarketPayload::Status {
-                status: MarketStatus::Live,
-                detail: None,
-            },
-        ))?;
-        assert_eq!(reducer.view().last_received_ms, received);
-        reducer.refresh_staleness(11_019, 5_000);
-        assert_eq!(reducer.view().status, MarketStatus::Stale);
-        Ok(())
-    }
-
-    #[test]
-    fn rejects_invalid_market_values() -> Result<(), LocalMarketError> {
-        let mut reducer = LocalMarketReducer::new(selection("BTC/USDT")?)?;
-        let crossed = envelope(
-            &reducer,
-            60_000,
-            MarketPayload::BookSnapshot {
-                bids: vec![UiBookLevel {
-                    price: Decimal::new(11, 0),
-                    quantity: Decimal::ONE,
-                }],
-                asks: vec![UiBookLevel {
-                    price: Decimal::new(10, 0),
-                    quantity: Decimal::ONE,
-                }],
-            },
-        );
-        assert_eq!(reducer.apply(crossed), Err(LocalMarketError::CrossedBook));
-        Ok(())
-    }
-
-    #[test]
-    fn store_reuses_identical_subscriptions_and_fences_replaced_sets()
-    -> Result<(), LocalMarketError> {
-        let btc = selection("BTC/USDT")?;
-        let eth = selection("ETH/USDT")?;
-        let mut store = LocalMarketStore::default();
-        assert_eq!(store.replace([btc.clone(), eth.clone()])?, Some(1));
-        assert_eq!(store.replace([eth.clone(), btc.clone()])?, None);
-
-        let old = MarketEnvelope {
-            generation: 1,
-            selection: btc.clone(),
-            event_time_ms: 60_000,
-            received_ms: 60_007,
-            payload: MarketPayload::Status {
-                status: MarketStatus::Live,
-                detail: None,
-            },
-        };
-        assert_eq!(store.apply(old.clone())?, ReduceOutcome::Applied);
-        assert_eq!(store.replace([eth])?, Some(2));
-        assert_eq!(store.apply(old)?, ReduceOutcome::IgnoredOldGeneration);
-        assert!(store.view(&btc).is_none());
-        Ok(())
-    }
-}
+#[cfg(test)]
+#[path = "market/sharing_tests.rs"]
+mod sharing_tests;

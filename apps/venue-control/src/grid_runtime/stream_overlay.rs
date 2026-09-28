@@ -740,6 +740,7 @@ mod tests {
             })
             .collect();
         Ok(TerminalAccountProjection {
+            balance_observed_ms: None,
             schema_version: TERMINAL_PROJECTION_SCHEMA_VERSION,
             credential_id: CREDENTIAL_ID.into(),
             trading_account_id: ACCOUNT_ID.into(),

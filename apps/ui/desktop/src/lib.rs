@@ -1,7 +1,9 @@
+mod account_assets;
 mod account_center;
 mod account_client;
 mod account_scope;
 mod app;
+mod branding;
 mod chart;
 mod chart_settings;
 mod chart_trading;
@@ -22,6 +24,7 @@ mod leader_bot_view;
 mod market;
 #[cfg(not(target_arch = "wasm32"))]
 mod market_client;
+mod market_prices;
 mod model;
 mod order_book_view;
 #[cfg(any(target_arch = "wasm32", feature = "preview"))]

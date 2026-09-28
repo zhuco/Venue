@@ -22,6 +22,35 @@ struct Catalogue {
 }
 
 impl SharedCatalogue {
+    pub(super) fn prepare_rules(
+        &self,
+        transport: &BinanceHttpTransport,
+        symbol: &Symbol,
+    ) -> impl Future<Output = Result<BinanceInstrumentRules, BinanceExecutionError>> + Send + 'static
+    {
+        let cache = self.clone();
+        let symbol = symbol.clone();
+        let generation = transport.instrument_generation();
+        let read = transport.prepare_exchange_info();
+        async move {
+            cache
+                .rules_with(&symbol, generation, || async move {
+                    let response = read.await.map_err(|_| {
+                        BinanceExecutionError::PreDispatch(
+                            PreDispatchRejection::CatalogueUnavailable,
+                        )
+                    })?;
+                    String::from_utf8(response.payload.to_vec()).map_err(|_| {
+                        BinanceExecutionError::PreDispatch(
+                            PreDispatchRejection::CatalogueUnavailable,
+                        )
+                    })
+                })
+                .await
+                .map(|(rules, _)| rules)
+        }
+    }
+
     pub(super) async fn rules(
         &self,
         transport: &BinanceHttpTransport,
@@ -112,6 +141,36 @@ mod tests {
     const CATALOGUE: &str = include_str!(
         "../../../../crates/venue-gateway-binance/tests/fixtures/exchange_info_btcusdt.json"
     );
+
+    #[tokio::test]
+    async fn prepared_rules_wait_without_owning_the_account_execution_lock()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let router =
+            BinanceExecutionRouter::new(venue_gateway_binance::BinanceTransportLimits::new(
+                std::time::Duration::from_secs(1),
+                65536,
+            )?);
+        let symbol: Symbol = "BTC/USDT".parse()?;
+        router
+            .catalogue
+            .rules_with(&symbol, 1, || async { Ok(CATALOGUE.into()) })
+            .await?;
+        let exchange = router.account_exchange("00000000-0000-4000-8000-000000000001", &symbol)?;
+        let state = router.catalogue.state.lock().await;
+        let rules = {
+            let guard = exchange.lock().await;
+            router.catalogue.prepare_rules(&guard.transport, &symbol)
+        };
+        let waiting = tokio::spawn(rules);
+        tokio::task::yield_now().await;
+        assert!(!waiting.is_finished());
+        let order_lock =
+            tokio::time::timeout(std::time::Duration::from_secs(1), exchange.lock()).await?;
+        drop(order_lock);
+        drop(state);
+        assert_eq!(waiting.await??.native_symbol, "BTCUSDT");
+        Ok(())
+    }
 
     #[tokio::test]
     async fn missing_contract_reports_catalogue_rules_not_account_or_order_failure()

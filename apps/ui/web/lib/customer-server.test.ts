@@ -213,3 +213,26 @@ test("configured leader creation forwards capital and the same request identity 
     keys.forEach((key, index) => { if (old[index] === undefined) delete process.env[key]; else process.env[key] = old[index]; });
   }
 });
+
+test("managed first verification forwards bounded source ratio without authority fields", async () => {
+  const keys = ["VENUE_WEB_SESSION_SIGNING_KEY", "VENUE_CONTROL_ORIGIN"] as const;
+  const old = keys.map(key => process.env[key]); const fetch = globalThis.fetch; let calls = 0;
+  try {
+    process.env.VENUE_WEB_SESSION_SIGNING_KEY = material;
+    process.env.VENUE_CONTROL_ORIGIN = "http://127.0.0.1:39180";
+    const cookie = sealCustomerSession(session()); assert.ok(cookie);
+    const authorization={sizing:{mode:"source_ratio",ratio:"0.5"},multiplier:"1"};
+    globalThis.fetch = async (_url, init) => {
+      calls++; assert.deepEqual(JSON.parse(String(init?.body)),{managed_id:"owned",authorization});
+      return Response.json({managed_id:"owned",verification:"verified"});
+    };
+    for (const ratio of ["0", "1.1", "-1"]) {
+      assert.equal((await customerResponse(request("managed-verify", {cookie,body:{managed_id:"owned",authorization:{...authorization,sizing:{mode:"source_ratio",ratio}}}}),"managed-verify")).status,400);
+    }
+    assert.equal(calls,0);
+    assert.equal((await customerResponse(request("managed-verify",{cookie,body:{managed_id:"owned",authorization}}),"managed-verify")).status,200);
+    assert.equal(calls,1);
+    const cleaned=customerPublicValue("managed-status","POST",{settings:{sizing:{...authorization.sizing,internal:"hidden"}}}) as {settings:{sizing:object}};
+    assert.deepEqual(cleaned.settings.sizing,authorization.sizing);
+  } finally { globalThis.fetch=fetch; keys.forEach((key,index)=>{if(old[index]===undefined) delete process.env[key]; else process.env[key]=old[index];}); }
+});

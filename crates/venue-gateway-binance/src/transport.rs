@@ -214,7 +214,23 @@ impl BinanceHttpTransport {
     pub fn prepare_clock_refresh(
         &self,
     ) -> impl std::future::Future<Output = Result<(), BinanceTransportError>> + Send + 'static {
-        let probe = Self {
+        let probe = self.public_probe();
+        async move { probe.synchronize_clock().await }
+    }
+
+    /// Prepares only a public catalogue read, reusing the HTTP pool without borrowing an
+    /// account's execution mutex. The returned future cannot dispatch a signed mutation.
+    pub fn prepare_exchange_info(
+        &self,
+    ) -> impl std::future::Future<Output = Result<BinanceHttpResponse, BinanceTransportError>>
+    + Send
+    + 'static {
+        let probe = self.public_probe();
+        async move { probe.fetch_usd_m_exchange_info().await }
+    }
+
+    fn public_probe(&self) -> Self {
+        Self {
             client: self.client.clone(),
             config: self.config.clone(),
             instrument_generation: self.instrument_generation,
@@ -225,8 +241,7 @@ impl BinanceHttpTransport {
             fixed_endpoint: self.fixed_endpoint,
             clock_offset_ms: Arc::clone(&self.clock_offset_ms),
             clock_synchronized: Arc::clone(&self.clock_synchronized),
-        };
-        async move { probe.synchronize_clock().await }
+        }
     }
 
     pub(crate) fn inherit_synchronized_clock(

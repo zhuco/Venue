@@ -30,6 +30,7 @@ pub async fn quotes(http: &reqwest::Client, instruments: &[Instrument]) -> Resul
                 change_percent: product(change - Decimal::ONE, Decimal::from(100))?,
                 quote_volume: Some(number(&ctx["dayNtlVlm"])?),
                 time_ms: 0,
+                derivatives: Some(derivatives(ctx)),
             })
         })();
         if let Ok(q) = parsed {
@@ -37,6 +38,37 @@ pub async fn quotes(http: &reqwest::Client, instruments: &[Instrument]) -> Resul
         }
     }
     Ok(result)
+}
+
+fn derivatives(context: &Value) -> DerivativeQuote {
+    DerivativeQuote {
+        use_local_observation_time: true,
+        funding_rate: number(&context["funding"]).ok(),
+        funding_time_ms: None,
+        next_funding_time_ms: None,
+        mark_price: number(&context["markPx"]).ok().filter(|value| *value > Decimal::ZERO),
+        // Hyperliquid's oraclePx is not silently relabeled as an exchange index price.
+        index_price: None,
+        open_interest_base: number(&context["openInterest"]).ok().filter(|value| *value >= Decimal::ZERO),
+        open_interest_native_quantity: None,
+        open_interest_native_unit: None,
+        open_interest_time_ms: None,
+    }
+}
+
+#[cfg(test)]
+mod derivative_tests {
+    use super::*;
+    #[test]
+    fn asset_context_keeps_base_oi_and_local_observation_clock() {
+        let row = serde_json::json!({"funding":"-0.000025", "openInterest":"1285463316.0",
+            "markPx":"0.097504", "oraclePx":"0.097425"});
+        let value = derivatives(&row);
+        assert_eq!(value.funding_rate, Some(Decimal::new(-25, 6)));
+        assert_eq!(value.open_interest_base, Some(Decimal::from(1_285_463_316_u64)));
+        assert!(value.index_price.is_none());
+        assert!(value.use_local_observation_time);
+    }
 }
 pub async fn trades(
     http: &reqwest::Client,
@@ -91,6 +123,8 @@ pub async fn catalog(http: &reqwest::Client) -> Result<Vec<Instrument>> {
         let quantity_scale = stamp(&row["szDecimals"])? as u32;
         result.push(Instrument {
             symbol,
+            native_symbol: string(&row["name"])?.to_owned(),
+            price_tick: None,
             price_scale: 6_u32.saturating_sub(quantity_scale),
             quantity_scale,
             contract_size: Decimal::ONE,
@@ -105,6 +139,7 @@ pub async fn candles(
     generation: u64,
     now: u64,
     before: Option<u64>,
+    limit: usize,
 ) -> Result<Vec<PublicBar>> {
     let interval = match ms {
         60_000 => "1m",
@@ -116,7 +151,7 @@ pub async fn candles(
         _ => return Err("unsupported interval".into()),
     };
     let end = before.map(|b| b.saturating_sub(1)).unwrap_or(now);
-    let value = info(http,json!({"type":"candleSnapshot","req":{"coin":instrument.symbol.base(),"interval":interval,"startTime":end.saturating_sub(ms*200),"endTime":end}})).await?;
+    let value = info(http,json!({"type":"candleSnapshot","req":{"coin":instrument.symbol.base(),"interval":interval,"startTime":end.saturating_sub(ms.saturating_mul(limit.clamp(1, 200) as u64)),"endTime":end}})).await?;
     let mut result = Vec::new();
     for row in array(&value)? {
         if row["s"] != instrument.symbol.base() || row["i"] != interval {

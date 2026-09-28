@@ -15,7 +15,6 @@ macro_rules! resources {
 
 resources! {
     Title => "EMA + ADX + MACD · ATR", "EMA＋ADX＋MACD · ATR归一化";
-    Enabled => "Enable this study", "启用此指标";
     Implementation => "Rust translation · AIScript source reference (not a script interpreter)", "Rust 移植版 · 附 AIScript 原稿（非脚本解释器）";
     Boundary => "Local public bars only. Virtual signals do not place orders or read account positions.", "仅计算本地公共 K 线；虚拟信号不下单，也不读取账户持仓。";
     Compatibility => "Preserves raw-signal cooldown. Positive cooldown can suppress entries; START is not ENTRY. AiCoin bar-by-bar parity is not yet verified.", "保留原稿的原始信号冷却；正冷却可能阻止开仓，启动不等于开仓。尚未经 AiCoin 逐根校准。";

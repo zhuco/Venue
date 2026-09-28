@@ -56,6 +56,7 @@ fn private_overlays_obey_account_symbol_and_visibility() -> Result<(), Box<dyn s
     overview.selected_credential_id = Some("credential".into());
     model.apply_account_overview(overview);
     let projection = TerminalAccountProjection {
+        balance_observed_ms: None,
         schema_version: TERMINAL_PROJECTION_SCHEMA_VERSION,
         credential_id: "credential".into(),
         trading_account_id: "selected-account".into(),
@@ -275,4 +276,46 @@ fn selection_overlays_require_confirmed_matching_venue_and_account() {
     model.select_market_server(crate::model::MarketServer::Binance);
     model.account_overview = None;
     assert!(collect(&model, "BTC/USDC", &settings).is_empty());
+}
+
+#[test]
+fn history_marker_shows_executed_notional_and_weighted_price_without_ids()
+-> Result<(), Box<dyn std::error::Error>> {
+    let mut model = crate::account_scope::tests::model();
+    let mut projection = crate::account_scope::tests::projection(1);
+    let first = venue_control_protocol::kol::TerminalFill {
+        symbol: "BTC/USDC".parse()?,
+        native_order_id: "hidden-order-id".into(),
+        native_trade_id: "first-trade".into(),
+        quantity: Decimal::from(2),
+        price: Decimal::from(10),
+        order_side: venue_domain::OrderSide::Buy,
+        position_side: venue_domain::PositionSide::Long,
+        maker: None,
+        occurred_ms: Some(1_000),
+    };
+    let mut second = first.clone();
+    second.native_trade_id = "second-trade".into();
+    second.quantity = Decimal::from(3);
+    second.price = Decimal::from(20);
+    projection.fills = vec![first.clone(), second, first];
+    model
+        .execution
+        .apply_private(Some(projection), &mut model.trade_dock);
+    let overlays = collect(&model, "BTC/USDC", &ChartTradingSettings::default());
+    let markers: Vec<_> = overlays
+        .iter()
+        .filter(|overlay| overlay.time_ms.is_some())
+        .collect();
+    assert_eq!(markers.len(), 1);
+    assert_eq!(markers[0].price, Decimal::from(16));
+    assert!(markers[0].label.contains("80 USDC"));
+    assert!(markers[0].label.starts_with("开多 @ 80 USDC 16"));
+    assert!(!markers[0].label.contains('\n'));
+    assert!(!markers[0].label.contains("成交价格"));
+    assert!(!markers[0].label.contains("成交名义价值"));
+    assert!(!markers[0].label.contains("ID"));
+    assert!(!markers[0].label.contains("hidden-order-id"));
+    assert!(!markers[0].label.contains("数量"));
+    Ok(())
 }

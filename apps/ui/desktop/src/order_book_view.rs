@@ -1,3 +1,4 @@
+mod derived;
 use eframe::egui::{self, Align, Align2, Color32, FontId, Pos2, Rect, RichText, Sense};
 use rust_decimal::Decimal;
 use venue_control_protocol::{AggressorSide, UiBookLevel, UiTrade};
@@ -54,7 +55,8 @@ pub fn show(
         mode_button(ui, &mut mode, BookMode::Bids, theme::BUY);
         mode_button(ui, &mut mode, BookMode::Asks, theme::SELL);
         ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
-            let precision = inferred_price_step(asks, bids)
+            let precision = model
+                .market_price_tick(symbol)
                 .map(|step| model.format_market_price(symbol, step))
                 .unwrap_or_else(|| "—".to_owned());
             ui.label(
@@ -72,25 +74,29 @@ pub fn show(
     } else {
         SINGLE_SIDE_ROWS
     };
-    let ask_rows = cumulative_rows(asks, limit);
-    let bid_rows = cumulative_rows(bids, limit);
-    let (ask_marks, bid_marks) = own_order_marks(model, symbol, asks, bids, limit);
+    let depth = derived::depth(ui.ctx(), model, symbol, asks, bids);
+    let ask_rows = asks.iter().zip(depth.0.iter().copied()).take(limit);
+    let bid_rows = bids.iter().zip(depth.1.iter().copied()).take(limit);
+    let (ask_marks, bid_marks) =
+        derived::own_order_marks(ui.ctx(), model, symbol, asks, bids, limit);
     let max_total = ask_rows
+        .clone()
         .last()
-        .map(|(_, total)| *total)
+        .map(|(_, total)| total)
         .unwrap_or(Decimal::ZERO)
         .max(
             bid_rows
+                .clone()
                 .last()
-                .map(|(_, total)| *total)
+                .map(|(_, total)| total)
                 .unwrap_or(Decimal::ZERO),
         );
     if mode.shows_asks() {
-        for (index, (level, cumulative)) in ask_rows.iter().enumerate().rev() {
+        for (index, (level, cumulative)) in ask_rows.enumerate().rev() {
             if book_row(
                 ui,
                 level,
-                *cumulative,
+                cumulative,
                 max_total,
                 theme::SELL,
                 model,
@@ -103,11 +109,11 @@ pub fn show(
     }
     price_mid_row(ui, trades, last, bid, ask, model, symbol);
     if mode.shows_bids() {
-        for (index, (level, cumulative)) in bid_rows.iter().enumerate() {
+        for (index, (level, cumulative)) in bid_rows.enumerate() {
             if book_row(
                 ui,
                 level,
-                *cumulative,
+                cumulative,
                 max_total,
                 theme::BUY,
                 model,
@@ -205,6 +211,7 @@ fn book_header(ui: &mut egui::Ui, language: Language, base: &str, quote: &str) {
     );
 }
 
+#[cfg(test)]
 fn cumulative_rows(levels: &[UiBookLevel], limit: usize) -> Vec<(&UiBookLevel, Decimal)> {
     let mut cumulative = Decimal::ZERO;
     levels
@@ -215,60 +222,6 @@ fn cumulative_rows(levels: &[UiBookLevel], limit: usize) -> Vec<(&UiBookLevel, D
             (level, cumulative)
         })
         .collect()
-}
-
-fn own_order_marks(
-    model: &AppModel,
-    symbol: &str,
-    asks: &[UiBookLevel],
-    bids: &[UiBookLevel],
-    limit: usize,
-) -> ([bool; SINGLE_SIDE_ROWS], [bool; SINGLE_SIDE_ROWS]) {
-    let mut marks = ([false; SINGLE_SIDE_ROWS], [false; SINGLE_SIDE_ROWS]);
-    let Some(credential) = model.selected_execution_credential() else {
-        return marks;
-    };
-    let Some(projection) = model
-        .execution
-        .private_projection_for(model.preferences.execution_account_id.as_deref())
-        .filter(|projection| {
-            credential.venue == model.preferences.market_server.venue()
-                && credential.credential_id == projection.credential_id
-                && credential.trading_account_id.as_ref() == Some(&projection.trading_account_id)
-        })
-    else {
-        return marks;
-    };
-    let Some((base, quote)) = symbol.split_once('/') else {
-        return marks;
-    };
-    // Scan the existing projection once; only visible price levels need storage.
-    for order in &projection.open_orders {
-        if order.symbol.base() != base
-            || order.symbol.quote() != quote
-            || order.quantity <= Decimal::ZERO
-            || order
-                .filled_quantity
-                .is_some_and(|filled| filled >= order.quantity)
-        {
-            continue;
-        }
-        let Some(price) = order.limit_price.filter(|price| *price > Decimal::ZERO) else {
-            continue;
-        };
-        let (levels, side_marks) = match order.order_side {
-            venue_domain::OrderSide::Buy => (bids, &mut marks.1),
-            venue_domain::OrderSide::Sell => (asks, &mut marks.0),
-        };
-        if let Some(index) = levels
-            .iter()
-            .take(limit.min(SINGLE_SIDE_ROWS))
-            .position(|level| level.price == price)
-        {
-            side_marks[index] = true;
-        }
-    }
-    marks
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -356,7 +309,7 @@ fn price_mid_row(
     symbol: &str,
 ) {
     let midpoint = bid.zip(ask).map(|(bid, ask)| (bid + ask) / Decimal::TWO);
-    let latest = trades.last().map(|trade| trade.price).or(last).or(midpoint);
+    let latest = last;
     let rising = trade_direction(trades, latest, midpoint);
     let color = if rising { theme::BUY } else { theme::SELL };
     let arrow = if rising { "↑" } else { "↓" };
@@ -486,27 +439,6 @@ fn trade_row(ui: &mut egui::Ui, trade: &UiTrade, model: &AppModel, symbol: &str)
     );
 }
 
-fn inferred_price_step(asks: &[UiBookLevel], bids: &[UiBookLevel]) -> Option<Decimal> {
-    asks.windows(2)
-        .chain(bids.windows(2))
-        .filter_map(|pair| positive_distance(pair[0].price, pair[1].price))
-        .chain(
-            asks.first()
-                .zip(bids.first())
-                .and_then(|(ask, bid)| positive_distance(ask.price, bid.price)),
-        )
-        .min()
-}
-
-fn positive_distance(left: Decimal, right: Decimal) -> Option<Decimal> {
-    let distance = if left >= right {
-        left - right
-    } else {
-        right - left
-    };
-    (!distance.is_zero()).then_some(distance)
-}
-
 fn compact_quantity(value: Decimal, fallback: String) -> String {
     for (threshold, suffix) in [
         (1_000_000_000_i64, "B"),
@@ -522,13 +454,7 @@ fn compact_quantity(value: Decimal, fallback: String) -> String {
 }
 
 fn clock_time(timestamp_ms: u64) -> String {
-    let seconds = timestamp_ms / 1_000 % 86_400;
-    format!(
-        "{:02}:{:02}:{:02}",
-        seconds / 3_600,
-        seconds / 60 % 60,
-        seconds % 60
-    )
+    crate::chart::format_clock_time(timestamp_ms)
 }
 
 #[cfg(test)]
@@ -560,6 +486,9 @@ mod tests {
             compact_quantity(Decimal::new(117_580, 0), String::new()),
             "117.58K"
         );
-        assert_eq!(clock_time(82_247_000), "22:50:47");
+        assert_eq!(
+            &clock_time(82_247_000)[..5],
+            crate::chart::format_timeline_label(82_247_000, crate::chart::ChartInterval::OneMinute)
+        );
     }
 }

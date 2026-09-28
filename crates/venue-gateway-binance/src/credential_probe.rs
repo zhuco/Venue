@@ -34,6 +34,8 @@ pub struct BinanceCredentialProbe {
     pub account_identity_hash: [u8; 32],
     pub observed_ms: u64,
     pub has_exposure: bool,
+    /// Includes ordinary and conditional orders; positions alone do not prevent adoption.
+    pub has_open_orders: bool,
     pub equity: Decimal,
     pub available_margin: Decimal,
 }
@@ -88,13 +90,13 @@ where
     let positions = read_surface(Surface::Positions).await?;
     let orders = read_surface(Surface::Orders).await?;
     let algos = read_surface(Surface::Algos).await?;
-    let has_exposure = positions_have_exposure(&positions)?
-        | orders_have_exposure(&orders)?
-        | orders_have_exposure(&algos)?;
+    let has_open_orders = orders_have_exposure(&orders)? | orders_have_exposure(&algos)?;
+    let has_exposure = positions_have_exposure(&positions)? | has_open_orders;
     Ok(BinanceCredentialProbe {
         account_identity_hash: identity_hash,
         observed_ms: now_ms()?,
         has_exposure,
+        has_open_orders,
         equity: balance.wallet_balance,
         available_margin: balance.available_balance,
     })
@@ -324,6 +326,7 @@ mod tests {
             })
             .await?;
             assert!(result.has_exposure);
+            assert_eq!(result.has_open_orders, exposed != Surface::Positions);
         }
         Ok(())
     }

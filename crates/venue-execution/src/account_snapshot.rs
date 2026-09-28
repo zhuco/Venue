@@ -155,6 +155,8 @@ pub struct SignedAccountSnapshot {
     /// Unchanged account balances retain this REST observation time, not the newer socket time.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     stream_rest_baseline_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    balance_observed_ms: Option<u64>,
 }
 
 impl SignedAccountSnapshot {
@@ -270,6 +272,7 @@ impl SignedAccountSnapshot {
             balances: Vec::new(),
             unknown_results,
             stream_rest_baseline_ms: None,
+            balance_observed_ms: None,
         })
     }
 
@@ -285,7 +288,22 @@ impl SignedAccountSnapshot {
     }
 
     pub fn balance_observed_at_ms(&self) -> u64 {
-        self.stream_rest_baseline_ms.unwrap_or(self.observed_at_ms)
+        self.balance_observed_ms
+            .or(self.stream_rest_baseline_ms)
+            .unwrap_or(self.observed_at_ms)
+    }
+
+    pub fn with_balances_at(
+        self,
+        balances: Vec<SignedAccountBalance>,
+        observed_ms: u64,
+    ) -> Result<Self, AccountHostValidationError> {
+        if observed_ms == 0 || observed_ms > self.observed_at_ms {
+            return Err(AccountHostValidationError::SignedSnapshot);
+        }
+        let mut snapshot = self.with_balances(balances)?;
+        snapshot.balance_observed_ms = Some(observed_ms);
+        Ok(snapshot)
     }
 
     #[must_use]

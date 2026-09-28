@@ -157,7 +157,7 @@ impl GridHotPathState {
         }
     }
 
-    fn request_recovery(&self, credential_id: &str) {
+    pub(super) fn request_recovery(&self, credential_id: &str) {
         if let Some(sender) = &self.recovery_requests {
             let _ = sender.try_send(credential_id.to_owned());
         }

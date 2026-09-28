@@ -1,5 +1,5 @@
 use rust_decimal::Decimal;
-use venue_domain::PublicBar;
+use venue_domain::{FieldState, PublicBar};
 
 use crate::catalog::{
     BarIndicator as _, IndicatorError, Reset as _,
@@ -229,11 +229,33 @@ impl CommonStudyEngine {
                 })
             })
             .transpose()?;
+        let avl = if matches!((&bar.base_volume, &bar.quote_volume),
+            (FieldState::Known(_), FieldState::Known(_))) {
+            scalar(self.avl.update(bar).map_err(map_catalog_error)?)?
+        } else {
+            // AVL is defined by exchange-reported quote amount. A missing
+            // sample breaks its cumulative series, not the rest of the chart.
+            self.avl.reset();
+            None
+        };
+        let (mfi, obv, emv) = if matches!(&bar.base_volume, FieldState::Known(_)) {
+            (
+                scalar(self.mfi.update(bar).map_err(map_catalog_error)?)?,
+                scalar(self.obv.update(bar).map_err(map_catalog_error)?)?,
+                scalar(self.emv.update(bar).map_err(map_catalog_error)?)?,
+            )
+        } else {
+            // A missing base-volume sample interrupts only volume studies.
+            self.mfi.reset();
+            self.obv.reset();
+            self.emv.reset();
+            (None, None, None)
+        };
         Ok(CommonStudyValues {
             sma_extra,
             ema_extra,
             wma,
-            avl: scalar(self.avl.update(bar).map_err(map_catalog_error)?)?,
+            avl,
             trix: self
                 .trix
                 .update(bar)
@@ -242,15 +264,15 @@ impl CommonStudyEngine {
                 .transpose()?,
             sar,
             supertrend,
-            mfi: scalar(self.mfi.update(bar).map_err(map_catalog_error)?)?,
+            mfi,
             kdj,
-            obv: scalar(self.obv.update(bar).map_err(map_catalog_error)?)?,
+            obv,
             cci: scalar(self.cci.update(bar).map_err(map_catalog_error)?)?,
             stoch_rsi,
             williams_r: scalar(self.williams_r.update(bar).map_err(map_catalog_error)?)?,
             dmi,
             momentum: scalar(self.momentum.update(bar).map_err(map_catalog_error)?)?,
-            emv: scalar(self.emv.update(bar).map_err(map_catalog_error)?)?,
+            emv,
         })
     }
 }

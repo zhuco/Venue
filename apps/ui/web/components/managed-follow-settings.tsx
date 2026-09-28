@@ -35,7 +35,8 @@ export function ManagedFollowSettingsPanel({ managedId, label, csrf, canManage, 
     if (pending || !relation || !hasFollowEquity(equity)) return;
     const data = new FormData(event.currentTarget);
     const text = (name: string) => String(data.get(name) ?? "").trim();
-    const sizing = sizingFromForm(data);
+    let sizing;
+    try { sizing = sizingFromForm(data); } catch (cause) { setError(cause instanceof Error ? cause.message : messages.unavailable); return; }
     const settings: ManagedFollowSettings = {
       sizing, allocated_capital: equity, multiplier: text("multiplier"),
       max_order_notional: sizing.mode === "fixed_notional" ? sizing.notional : equity, max_total_notional: sizing.mode === "fixed_notional" ? sizing.notional : equity,
@@ -67,7 +68,7 @@ export function ManagedFollowSettingsPanel({ managedId, label, csrf, canManage, 
         <div className="buttons"><button disabled={busy || Boolean(pending) || !canManage || relation.state !== "paused" || relation.activation_requested} onClick={() => void submit("managed-follow", { managed_id: managedId, request_id: crypto.randomUUID(), relation_id: relation.relation_id, expected_revision: relation.revision, action: "activate", risk_confirmed: true })}>重新申请跟单</button>
           <button disabled={busy || Boolean(pending)} onClick={() => void submit("managed-follow", { managed_id: managedId, request_id: crypto.randomUUID(), relation_id: relation.relation_id, expected_revision: relation.revision, action: "pause", risk_confirmed: false })}>暂停并撤销同步挂单</button></div>
       </>}
-      <p className="muted">保存 API 即授权跟单；验证成功后自动申请激活。系统仍校验空仓、无挂单、权限和单一执行器；暂停保留已有仓位。</p>
+      <p className="muted">保存 API 即授权跟单；验证成功后自动申请激活。允许已有持仓，启用不会自动补仓或平仓；仍检查无挂单、无未决命令、权限和单一执行器。</p>
       <div className="buttons"><button disabled={busy || Boolean(pending)} onClick={() => dialog.current?.close()}>关闭</button></div>
     </dialog>
   </>;

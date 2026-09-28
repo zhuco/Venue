@@ -69,14 +69,13 @@ impl HyperliquidHttpTransport {
         max_body_bytes: usize,
     ) -> Result<Self, HyperliquidTransportError> {
         validate_limits(timeout, max_body_bytes)?;
-        let client = reqwest::Client::builder()
-            .no_proxy()
-            .redirect(reqwest::redirect::Policy::none())
-            .retry(reqwest::retry::never())
-            .connect_timeout(timeout)
-            .timeout(timeout)
-            .build()
-            .map_err(|_| HyperliquidTransportError::Configuration)?;
+        let client = venue_gateway_api::transport_pool::account_http_client(
+            timeout,
+            Some(timeout),
+            true,
+            true,
+        )
+        .map_err(|_| HyperliquidTransportError::Configuration)?;
         Ok(Self {
             client,
             timeout,

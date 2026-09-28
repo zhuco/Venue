@@ -28,10 +28,15 @@ fn acquire_at(path: &Path) -> io::Result<Option<File>> {
     #[cfg(windows)]
     {
         use std::os::windows::fs::OpenOptionsExt;
-        // Prevent deleting/replacing the locked inode while allowing other launchers to inspect it.
-        options.share_mode(3);
+        // Deny a second writable handle as well as deletion/replacement on Windows.
+        options.share_mode(0);
     }
-    let file = options.open(path)?;
+    let file = match options.open(path) {
+        Ok(file) => file,
+        #[cfg(windows)]
+        Err(error) if error.raw_os_error() == Some(32) => return Ok(None),
+        Err(error) => return Err(error),
+    };
     match file.try_lock() {
         Ok(()) => Ok(Some(file)),
         Err(TryLockError::WouldBlock) => Ok(None),

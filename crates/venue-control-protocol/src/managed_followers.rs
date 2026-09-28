@@ -36,6 +36,8 @@ pub struct ManagedFollowerCreateRequest {
 #[serde(deny_unknown_fields)]
 pub struct ManagedFollowerVerifyRequest {
     pub managed_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authorization: Option<crate::follow_sizing::FollowAuthorization>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

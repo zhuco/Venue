@@ -24,7 +24,6 @@ pub(crate) struct TradingBadge {
 pub(crate) struct OrderTagState {
     pending: Vec<(TerminalOrderSelection, String)>,
     uncertain_cancels: std::collections::HashSet<String>,
-    crossed: Vec<(TerminalOrderSelection, u64)>,
 }
 
 impl OrderTagState {
@@ -41,17 +40,9 @@ impl OrderTagState {
     }
 
     pub(crate) fn hidden(&self, selection: &TerminalOrderSelection) -> bool {
-        self.crossed.iter().any(|(target, _)| target == selection)
-            || self
-                .pending
-                .iter()
-                .any(|(target, id)| target == selection && !self.uncertain_cancels.contains(id))
-    }
-
-    pub(crate) fn crossed_price(&mut self, target: TerminalOrderSelection, trade_ms: u64) {
-        if !self.crossed.iter().any(|(existing, _)| existing == &target) {
-            self.crossed.push((target, trade_ms));
-        }
+        self.pending
+            .iter()
+            .any(|(target, id)| target == selection && !self.uncertain_cancels.contains(id))
     }
 
     pub(crate) fn is_pending(&self, selection: &TerminalOrderSelection) -> bool {
@@ -104,16 +95,6 @@ impl OrderTagState {
         &mut self,
         projection: &venue_control_protocol::kol::TerminalAccountProjection,
     ) {
-        // A newer private snapshot overrides the speculative drawing, including partial fills.
-        self.crossed.retain(|(target, trade_ms)| {
-            target.credential_id == projection.credential_id
-                && target.trading_account_id == projection.trading_account_id
-                && projection.observed_ms < *trade_ms
-                && projection.open_orders.iter().any(|order| {
-                    order.symbol == target.symbol
-                        && order.native_order_id.as_ref() == Some(&target.native_order_id)
-                })
-        });
         self.pending.retain(|(target, _)| {
             target.trading_account_id != projection.trading_account_id
                 || target.credential_id != projection.credential_id
@@ -607,6 +588,7 @@ pub(crate) fn apply_interaction(
             preview @ Interaction::Preview(..) => {
                 context.data_mut(|data| {
                     data.insert_temp(action_id().with("preview"), preview);
+                    data.insert_temp(action_id().with("preview").with("skip"), false);
                     data.insert_temp(
                         action_id().with("preview_scope"),
                         model.confirmed_account_scope(),
@@ -632,40 +614,47 @@ pub(crate) fn apply_interaction(
         }
         let language = model.preferences.language;
         let mut open = true;
-        let mut submit = false;
-        egui::Window::new(label(
-            language,
-            "调整挂单价",
-            "Change order price",
-        ))
-        .id(preview_id)
-        .open(&mut open)
-        .collapsible(false)
-        .resizable(false)
-        .show(context, |ui| {
-            ui.label(format!(
-                "{}   {} → {}",
-                selection.symbol,
-                old.normalize(),
-                new.normalize()
-            ));
-            ui.colored_label(
-                theme::WARNING,
-                label(
-                    language,
-                    "先撤原单，再按剩余数量挂新价。",
-                    "Cancel, then replace the remainder at the new price.",
-                ),
-            );
-            ui.label(label(
-                language,
-                "撤单前仍可能成交；新挂失败不恢复原单。",
-                "Fills may occur before cancellation. A failed replacement leaves the original cancelled.",
-            ));
-            submit = ui.add_enabled(!model.execution.chart_orders.is_pending(&selection) && model.confirmed_account_scope().is_some() && old != new,
-                egui::Button::new(label(language, "确认改价", "Confirm change"))).clicked();
-        });
+        let can_submit = !model.execution.chart_orders.is_pending(&selection)
+            && model.confirmed_account_scope().is_some()
+            && old != new;
+        let mut submit = model.preferences.trading.skip_replace_confirmation && can_submit;
+        let skip_id = preview_id.with("skip");
+        let mut skip = context
+            .data(|data| data.get_temp::<bool>(skip_id))
+            .unwrap_or(false);
+        if !model.preferences.trading.skip_replace_confirmation {
+            egui::Window::new(label(language, "调整挂单价", "Change order price"))
+                .id(preview_id)
+                .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+                .open(&mut open)
+                .collapsible(false)
+                .resizable(false)
+                .show(context, |ui| {
+                    ui.label(format!(
+                        "{}   {} → {}",
+                        selection.symbol,
+                        old.normalize(),
+                        new.normalize()
+                    ));
+                    ui.checkbox(
+                        &mut skip,
+                        label(
+                            language,
+                            "下次改价不再二次确认",
+                            "Don't ask again when changing price",
+                        ),
+                    );
+                    submit = ui
+                        .add_enabled(
+                            can_submit,
+                            egui::Button::new(label(language, "确认改价", "Confirm change")),
+                        )
+                        .clicked();
+                });
+            context.data_mut(|data| data.insert_temp(skip_id, skip));
+        }
         if submit {
+            model.preferences.trading.skip_replace_confirmation |= skip;
             let request = venue_control_protocol::kol::TerminalCancelRequest {
                 replacement_price: Some(new),
                 schema_version: venue_control_protocol::kol::TERMINAL_SCHEMA_VERSION,
@@ -692,6 +681,7 @@ pub(crate) fn apply_interaction(
         }
         if !open {
             context.data_mut(|data| data.remove::<Interaction>(preview_id));
+            context.data_mut(|data| data.remove::<bool>(skip_id));
         }
     }
 }

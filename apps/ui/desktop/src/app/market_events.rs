@@ -1,5 +1,4 @@
 use super::*;
-mod crossed_orders;
 
 pub(super) fn apply(
     model: &mut AppModel,
@@ -18,6 +17,45 @@ pub(super) fn apply(
         return;
     }
     match event {
+        LocalMarketClientEvent::SharedHistory { request, result } => {
+            if request.generation != model.local_markets.generation()
+                || request.binding.venue != server.venue() { return; }
+            if let Err(error) = model.local_markets.finish_shared_history(&request, result) {
+                model.notice(format!("Shared market history rejected: {error}"));
+            } else { context.request_repaint(); }
+        }
+        LocalMarketClientEvent::SessionDayHistory { generation, binding, bars, forming } => {
+            if generation != model.local_markets.generation() || binding.venue != server.venue() { return; }
+            if let Err(error) = model.local_markets.apply_session_history(generation, binding, bars, forming) {
+                model.notice(format!("Session day history rejected: {error}"));
+            } else {
+                context.request_repaint();
+            }
+        }
+        LocalMarketClientEvent::SessionDayBar { generation, binding, bar, confirmed } => {
+            if generation != model.local_markets.generation() || binding.venue != server.venue() { return; }
+            if let Err(error) = model.local_markets.apply_session_day(generation, binding, bar, confirmed) {
+                model.notice(format!("Session day bar rejected: {error}"));
+            } else {
+                context.request_repaint();
+            }
+        }
+        LocalMarketClientEvent::BaseMinuteHistory { generation, binding, bars, forming } => {
+            if generation != model.local_markets.generation() || binding.venue != server.venue() { return; }
+            if let Err(error) = model.local_markets.apply_base_history(generation, binding, bars, forming) {
+                model.notice(format!("Base 1m history rejected: {error}"));
+            } else {
+                context.request_repaint();
+            }
+        }
+        LocalMarketClientEvent::BaseMinuteBar { generation, binding, bar, confirmed } => {
+            if generation != model.local_markets.generation() || binding.venue != server.venue() { return; }
+            if let Err(error) = model.local_markets.apply_base_minute(generation, binding, bar, confirmed) {
+                model.notice(format!("Base 1m bar rejected: {error}"));
+            } else {
+                context.request_repaint();
+            }
+        }
         LocalMarketClientEvent::History { request, result } => {
             if request.generation != model.local_markets.generation()
                 || request.selection.binding.venue != server.venue()
@@ -54,12 +92,6 @@ pub(super) fn apply(
             }
             // The active subscription is the scope boundary. Binance catalog and history load in
             // parallel; a delayed catalog must not discard the only initial history response.
-            let trade = match &envelope.payload {
-                crate::market::MarketPayload::Trade(trade) => {
-                    Some((envelope.selection.binding.symbol.clone(), trade.clone()))
-                }
-                _ => None,
-            };
             let history = matches!(
                 &envelope.payload,
                 crate::market::MarketPayload::RestHistory { .. }
@@ -90,8 +122,6 @@ pub(super) fn apply(
                     .map_or(0, |view| view.bars.len());
                 tracing::info!(target: "venueflow::chart_loading", generation, symbol = %selection.binding.symbol, interval = selection.interval.label(), bars, "Chart initial history accepted");
                 context.request_repaint();
-            } else if let Some((symbol, trade)) = trade {
-                crossed_orders::observe(model, &symbol, &trade, context);
             }
         }
         LocalMarketClientEvent::Catalog(symbols) => {

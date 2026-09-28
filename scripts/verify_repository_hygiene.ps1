@@ -46,6 +46,8 @@ if ($LASTEXITCODE -ne 0) {
 }
 
 $violations = [System.Collections.Generic.List[string]]::new()
+$deleted = @(git -c core.quotepath=false ls-files --deleted)
+if ($LASTEXITCODE -ne 0) { throw "git ls-files --deleted failed" }
 $totalBytes = [int64]0
 foreach ($relativePath in $tracked) {
     $normalized = $relativePath.Replace("\", "/")
@@ -68,7 +70,10 @@ foreach ($relativePath in $tracked) {
         $violations.Add("generated, binary, runtime, or secret extension is tracked: $normalized")
     }
     if (-not (Test-Path -LiteralPath $relativePath -PathType Leaf)) {
-        $violations.Add("tracked path is missing from the worktree: $normalized")
+        # Explicit source deletions are valid changes; protected artifacts are checked below.
+        if ($deleted -notcontains $relativePath) {
+            $violations.Add("tracked path is missing from the worktree: $normalized")
+        }
         continue
     }
     $bytes = (Get-Item -LiteralPath $relativePath).Length

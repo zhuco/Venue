@@ -97,7 +97,11 @@ fn compact_controls(ui: &mut egui::Ui, model: &mut AppModel) -> Option<TradingAc
                     ui.selectable_value(&mut model.trade_dock.amount_in_base, true, &base);
                 });
             if previous != model.trade_dock.amount_in_base {
-                model.trade_dock.amount_input.clear();
+                model.trade_dock.amount_input = if model.trade_dock.amount_in_base {
+                    String::new()
+                } else {
+                    model.preferences.trading.manual_quote_amount.clone()
+                };
                 model.trade_dock.armed_action = None;
             }
         });
@@ -116,6 +120,7 @@ fn compact_controls(ui: &mut egui::Ui, model: &mut AppModel) -> Option<TradingAc
             .changed()
         {
             model.trade_dock.armed_action = None;
+            model.remember_manual_quote_amount();
         }
     });
     ui.horizontal(|ui| {
@@ -219,18 +224,7 @@ fn symbol_assets(symbol: &str) -> (String, String) {
 }
 
 fn preset_equity(model: &AppModel) -> Option<rust_decimal::Decimal> {
-    let scope = model.confirmed_account_scope()?;
-    let projection = model
-        .execution
-        .private_projection_for(Some(&scope.trading_account_id))?;
-    if projection.credential_id != scope.credential_id {
-        return None;
-    }
-    // Use portfolio USD valuation, never add asset balances with different units.
-    projection
-        .assets
-        .iter()
-        .find(|asset| asset.asset == "USD")
+    crate::account_assets::for_model(model, crate::account_assets::AssetPurpose::PortfolioUsd)
         .map(|asset| asset.equity)
         .filter(|equity| *equity > rust_decimal::Decimal::ZERO)
 }
@@ -426,12 +420,14 @@ pub(crate) fn apply_single_action(
                 model.trade_dock.selected_size_preset = index;
                 model.trade_dock.amount_input.clear();
                 model.trade_dock.amount_in_base = false;
+                model.preferences.trading.manual_quote_amount.clear();
                 model.trade_dock.armed_action = None;
             }
             return;
         }
         TradingAction::ClearSelection => {
             model.trade_dock.clear_selection();
+            model.preferences.trading.manual_quote_amount.clear();
             return;
         }
         TradingAction::CenterMarket => {

@@ -1,5 +1,7 @@
 use eframe::egui::{self, RichText};
-use venue_control_protocol::{ConnectionState, kol::TerminalAsset};
+use venue_control_protocol::ConnectionState;
+#[cfg(test)]
+use venue_control_protocol::kol::TerminalAsset;
 
 use crate::{
     i18n::{TextKey, text},
@@ -7,21 +9,19 @@ use crate::{
     theme,
 };
 
+#[cfg(test)]
 fn selected_account_asset<'a>(
     assets: &'a [TerminalAsset],
-    selected_symbol: &str,
+    _symbol: &str,
 ) -> Option<&'a TerminalAsset> {
-    let quote = selected_symbol.split_once('/')?.1;
-    assets
-        .iter()
-        .find(|asset| asset.asset == quote)
-        .or_else(|| assets.iter().find(|asset| asset.asset == "USD"))
+    crate::account_assets::select(assets, crate::account_assets::AssetPurpose::PortfolioUsd)
 }
 
 pub(super) fn show(ui: &mut egui::Ui, model: &AppModel) {
     let language = model.preferences.language;
     let account_id = model.preferences.execution_account_id.as_deref();
     let now = super::now_ms();
+    let account_now = model.execution.account_now_ms(now);
     let private_projection = model.execution.private_projection_for(account_id);
     let private_current = model.execution.private_ready(account_id, now);
     let node_key = if account_id.is_none() {
@@ -41,7 +41,7 @@ pub(super) fn show(ui: &mut egui::Ui, model: &AppModel) {
             crate::i18n::Language::English => "Account refresh failed",
         }
     } else if private_projection
-        .is_some_and(|projection| projection.observed_ms > now.saturating_add(2_000))
+        .is_some_and(|projection| projection.observed_ms > account_now.saturating_add(2_000))
     {
         match language {
             crate::i18n::Language::SimplifiedChinese => "本机与服务器时钟不一致",
@@ -75,12 +75,12 @@ pub(super) fn show(ui: &mut egui::Ui, model: &AppModel) {
         node_hint.push_str(&match language {
             crate::i18n::Language::SimplifiedChinese => format!(
                 "\n服务器账户事实距今 {:.1} 秒；桌面上次接收距今 {:.1} 秒。超过 15 秒提示更新延迟。",
-                now.saturating_sub(projection.observed_ms) as f64 / 1000.0,
+                account_now.saturating_sub(projection.observed_ms) as f64 / 1000.0,
                 now.saturating_sub(model.execution.private_received_ms()) as f64 / 1000.0,
             ),
             crate::i18n::Language::English => format!(
                 "\nServer facts age: {:.1}s; last desktop receipt: {:.1}s ago. Update delay warning after 15s.",
-                now.saturating_sub(projection.observed_ms) as f64 / 1000.0,
+                account_now.saturating_sub(projection.observed_ms) as f64 / 1000.0,
                 now.saturating_sub(model.execution.private_received_ms()) as f64 / 1000.0,
             ),
         });
@@ -104,21 +104,26 @@ pub(super) fn show(ui: &mut egui::Ui, model: &AppModel) {
         },
         |c| format!("{} · {}", c.venue, c.label),
     );
-    let asset = private_projection.and_then(|projection| {
-        selected_account_asset(&projection.assets, &model.preferences.selected_symbol)
-    });
-    let funds_hint = format!(
+    let asset =
+        crate::account_assets::for_model(model, crate::account_assets::AssetPurpose::PortfolioUsd);
+    let mut funds_hint = format!(
         "{}: {account_id}\n{}",
         text(language, TextKey::Account),
         match language {
             crate::i18n::Language::SimplifiedChinese => {
-                "资金来自同一账户最近的签名资产快照；USD 为统一账户计价，不转换为当前交易对报价币。资产不随仓位事件实时刷新。"
+                "资金来自同一账户最近的签名资产快照；USD 为统一账户计价，不转换为当前交易对报价币。账户事件触发独立资产刷新。"
             }
             crate::i18n::Language::English => {
-                "Latest signed asset snapshot for the same account. USD is portfolio valuation, not converted to the symbol quote. Position events do not refresh balances."
+                "Latest signed asset snapshot for the same account. USD is portfolio valuation, not converted to the symbol quote. Account events trigger an independent asset refresh."
             }
         }
     );
+    if let Some(asset) = asset.filter(|asset| asset.observed_ms > 0) {
+        funds_hint.push_str(&format!(
+            "\n{}",
+            crate::chart::format_clock_time(asset.observed_ms)
+        ));
+    }
     egui::Frame::new()
         .fill(theme::BG_SECONDARY)
         .inner_margin(egui::Margin::symmetric(10, 3))
@@ -286,21 +291,25 @@ pub(super) fn show(ui: &mut egui::Ui, model: &AppModel) {
                 } else {
                     theme::TEXT_SECONDARY
                 };
-                // Numeric fields are never rounded to fit; ellipsis exposes the exact value on hover.
+                // Display portfolio totals at cents; ellipsis still exposes the full label on hover.
+                let estimate = crate::account_assets::estimated_equity(model);
                 for (key, value) in [
-                    (TextKey::Equity, asset.map(|a| a.equity)),
+                    (TextKey::Equity, estimate.map(|v| v.0).or_else(|| asset.map(|a| a.equity))),
                     (TextKey::MarginShort, asset.and_then(|a| a.available_margin)),
                 ] {
-                    let amount =
-                        value.map_or_else(|| "—".to_owned(), |v| v.normalize().to_string());
-                    let asset_label = asset.map_or("", |asset| asset.asset.as_str());
+                    let estimated = key == TextKey::Equity && estimate.is_some();
+                    let amount = value.map_or_else(|| "—".to_owned(), |v| format!("{}{v:.2}", if estimated { "≈" } else { "" }));
+                    let asset_label = asset.map_or("", |asset| asset.asset);
                     let full = format!("{} {amount} {asset_label}", text(language, key));
                     status_text(
                         ui,
                         widths[4],
                         full.clone(),
                         color,
-                        &format!("{full}\n{funds_hint}"),
+                        &format!("{full}\n{funds_hint}{}", if estimated {
+                            if estimate.is_some_and(|v| v.1) { "\n估算：签名权益加接收后价格变动，USDT/USDC按1USD近似；不用于下单额度 / Estimate, stablecoin USD proxy; not sizing." }
+                            else { "\n估算：签名权益加接收后价格变动；不用于下单额度 / Estimate since receipt; not sizing." }
+                        } else { "" }),
                     );
                 }
             });
@@ -382,7 +391,7 @@ mod tests {
     }
 
     #[test]
-    fn funds_follow_the_selected_symbol_quote_asset() {
+    fn account_totals_do_not_follow_the_selected_symbol_quote_asset() {
         let assets = vec![
             TerminalAsset {
                 asset: "USDT".into(),
@@ -397,7 +406,7 @@ mod tests {
         ];
         assert_eq!(
             selected_account_asset(&assets, "SOL/USDC").map(|asset| asset.equity),
-            Some(rust_decimal::Decimal::new(2, 0))
+            None
         );
         assert!(selected_account_asset(&assets, "SOL/FDUSD").is_none());
         assert!(selected_account_asset(&assets, "INVALID").is_none());
@@ -419,6 +428,11 @@ mod tests {
                 assets[0].available_margin
             );
         }
+        assert_eq!(format!("{:.2}", assets[0].equity), "153.97");
+        assert_eq!(
+            format!("{:.2}", assets[0].available_margin.unwrap_or_default()),
+            "144.99"
+        );
     }
 }
 

@@ -273,6 +273,15 @@ impl StrategyGridStore {
             .await?;
         }
         tx.commit().await.map_err(|_| Error::Unavailable)?;
+        tracing::warn!(
+            instance_id = %record.instance_id,
+            reason,
+            consecutive_failures = transition.progress.consecutive_failures,
+            pending_since_ms = transition.progress.pending_since_ms,
+            timed_out = transition.timed_out,
+            paused = transition.pause,
+            "Strategy grid convergence failure recorded"
+        );
         Ok(transition.pause)
     }
 
@@ -326,7 +335,9 @@ impl StrategyGridStore {
         let last = current
             .try_get::<i64, _>("last_failed_strategy_sequence")
             .map_err(|_| Error::Conflict)?;
-        let failures=sqlx::query("SELECT COALESCE(MAX(strategy_sequence),0) AS last_sequence,count(*) AS failure_count FROM venue_binance_commands WHERE trading_account_id=$1 AND strategy_command->'payload'->'owner'->>'strategy_instance_id'=$2 AND command_state='rejected' AND strategy_sequence>$3")
+        // A pre-send plan invalidation is normal convergence, not an exchange rejection.
+        // NULL/unknown legacy reasons remain failures; only this proven local outcome is exempt.
+        let failures=sqlx::query("SELECT COALESCE(MAX(strategy_sequence),0) AS last_sequence,count(*) AS failure_count FROM venue_binance_commands WHERE trading_account_id=$1 AND strategy_command->'payload'->'owner'->>'strategy_instance_id'=$2 AND command_state='rejected' AND sanitized_error_code IS DISTINCT FROM 'strategy_grid_plan_changed' AND strategy_sequence>$3")
             .bind(&record.trading_account_id).bind(&record.instance_id).bind(last)
             .fetch_one(&mut *tx).await.map_err(|_| Error::Unavailable)?;
         let count = failures

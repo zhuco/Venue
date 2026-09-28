@@ -56,7 +56,7 @@ function Get-VenueBuildPlan {
     Assert-VenuePlainPath $target
     Assert-VenuePlainPath (Join-Path $root '.guard')
     Assert-VenuePlainPath (Join-Path (Join-Path $root '.tmp') $Slot)
-    return [PSCustomObject]@{RepoRoot=$repo;Root=$root;Slot=$Slot;TargetDirectory=$target;TempDirectory=(Join-Path (Join-Path $root '.tmp') $Slot);GuardDirectory=(Join-Path $root '.guard');HostedCI=$false;BudgetBytes=200GB;MinimumHostFree=100GB;MinimumGuestFree=20GB;HostRoot='F:\';GuestRoot='G:\'}
+    return [PSCustomObject]@{RepoRoot=$repo;Root=$root;Slot=$Slot;TargetDirectory=$target;TempDirectory=(Join-Path (Join-Path $root '.tmp') $Slot);GuardDirectory=(Join-Path $root '.guard');HostedCI=$false;BudgetBytes=500GB;MinimumHostFree=100GB;MinimumGuestFree=20GB;HostRoot='F:\';GuestRoot='G:\'}
 }
 
 function Get-VenueCacheBytes {
@@ -151,9 +151,10 @@ function Enter-VenueBuildGuard {
             TEMP=$plan.TempDirectory; TMP=$plan.TempDirectory
         }
         if (-not $plan.HostedCI -and $plan.Slot -eq 'main') {
-            # sccache rejects CARGO_INCREMENTAL=1 even for Cargo's compiler probe.
-            # Main uses direct incremental compilation; isolated slots retain wrappers.
+            # Keep the process environment clear for tools that honour it. Cargo itself
+            # receives a higher-precedence config override from Invoke-VenueBuild.ps1.
             $settings.RUSTC_WRAPPER = ''
+            $settings.CARGO_BUILD_RUSTC_WRAPPER = ''
         }
         foreach ($name in $settings.Keys) {
             $saved[$name] = [Environment]::GetEnvironmentVariable($name,'Process')

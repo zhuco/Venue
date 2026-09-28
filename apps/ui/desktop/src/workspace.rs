@@ -59,6 +59,11 @@ pub struct Pane {
     pub trading_display: crate::chart_trading::ChartTradingSettings,
     #[serde(skip)]
     pub history_requested: bool,
+    #[serde(skip)]
+    #[cfg(not(target_arch = "wasm32"))]
+    pub heatmap_history_scope: Option<crate::market::MarketSelection>,
+    #[serde(skip)]
+    pub analysis: crate::chart_view::analysis::AnalysisInteraction,
 }
 
 impl Pane {
@@ -78,6 +83,9 @@ impl Pane {
             viewport: ChartViewport::default(),
             trading_display: crate::chart_trading::ChartTradingSettings::default(),
             history_requested: false,
+            #[cfg(not(target_arch = "wasm32"))]
+            heatmap_history_scope: None,
+            analysis: Default::default(),
         }
     }
 
@@ -90,6 +98,9 @@ impl Pane {
             viewport: ChartViewport::default(),
             trading_display: crate::chart_trading::ChartTradingSettings::default(),
             history_requested: false,
+            #[cfg(not(target_arch = "wasm32"))]
+            heatmap_history_scope: None,
+            analysis: Default::default(),
         }
     }
 

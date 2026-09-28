@@ -3,7 +3,12 @@ mod native {
     mod delivery;
     mod history;
     mod latency;
+    mod open_interest;
+    mod public_cache;
+    mod source_demand;
     use delivery::MarketSender;
+    pub(crate) use source_demand::{SharedSourceDemand, SourceDemands, source_is_requested,
+        wait_until_source_disabled};
     mod multi;
     use std::{
         collections::BTreeSet,
@@ -33,7 +38,8 @@ mod native {
         BinanceFormingBar, BinanceKlineInterval, BinancePublicInstrument, BinancePublicKline,
         native_symbol, parse_public_exchange_catalog, parse_public_market_agg_trade,
         parse_public_market_bbo, parse_public_market_depth20_snapshot, parse_public_market_kline,
-        parse_public_market_rest_klines, parse_public_market_ticker_array,
+        parse_public_mark_funding,
+        parse_public_market_rest_klines_with_forming, parse_public_market_ticker_array,
         parse_public_market_ticker_snapshot,
     };
 
@@ -55,9 +61,11 @@ mod native {
     const WS_FRAME_LIMIT: usize = 1024 * 1024;
     const PROXY_RESPONSE_LIMIT: usize = 16 * 1024;
     const COMMAND_CAPACITY: usize = 8;
+
     const EVENT_CAPACITY: usize = 8_192;
     const MAX_SUBSCRIPTIONS: usize = 8;
     const DEFAULT_HISTORY_LIMIT: usize = 1_000;
+    const INITIAL_VISIBLE_HISTORY_LIMIT: usize = crate::chart::DEFAULT_VISIBLE_BARS + 2;
     const REPAINT_INTERVAL: Duration = Duration::from_millis(50);
     const PING_INTERVAL: Duration = Duration::from_millis(500);
     const PONG_DEADLINE: Duration = Duration::from_secs(45);
@@ -65,6 +73,34 @@ mod native {
 
     #[derive(Clone, Debug, PartialEq)]
     pub enum LocalMarketClientEvent {
+        SharedHistory {
+            request: crate::market::SharedHistoryRequest,
+            result: Result<Vec<PublicBar>, String>,
+        },
+        SessionDayHistory {
+            generation: u64,
+            binding: venue_gateway_api::PublicMarketBinding,
+            bars: Vec<PublicBar>,
+            forming: Option<PublicBar>,
+        },
+        SessionDayBar {
+            generation: u64,
+            binding: venue_gateway_api::PublicMarketBinding,
+            bar: PublicBar,
+            confirmed: bool,
+        },
+        BaseMinuteHistory {
+            generation: u64,
+            binding: venue_gateway_api::PublicMarketBinding,
+            bars: Vec<PublicBar>,
+            forming: Option<PublicBar>,
+        },
+        BaseMinuteBar {
+            generation: u64,
+            binding: venue_gateway_api::PublicMarketBinding,
+            bar: PublicBar,
+            confirmed: bool,
+        },
         History {
             request: crate::market::HistoryRequest,
             result: Result<Vec<PublicBar>, String>,
@@ -91,6 +127,8 @@ mod native {
     #[derive(Debug)]
     pub struct LocalMarketClient {
         history_commands: Sender<crate::market::HistoryRequest>,
+        shared_history_commands: Sender<crate::market::SharedHistoryRequest>,
+        source_demands: tokio::sync::watch::Sender<SourceDemands>,
         commands: Sender<LocalMarketCommand>,
         events: Receiver<LocalMarketClientEvent>,
         worker: Option<thread::JoinHandle<()>>,
@@ -104,6 +142,8 @@ mod native {
             let (command_tx, command_rx) = bounded(COMMAND_CAPACITY);
             let (event_tx, event_rx) = bounded(EVENT_CAPACITY);
             let (history_tx, history_rx) = bounded(MAX_SUBSCRIPTIONS);
+            let (shared_history_tx, shared_history_rx) = bounded(MAX_SUBSCRIPTIONS);
+            let (source_demands, source_demand_rx) = tokio::sync::watch::channel(SourceDemands::new());
             let worker = thread::Builder::new()
                 .name("venueflow-local-market".to_owned())
                 .spawn(move || {
@@ -111,12 +151,16 @@ mod native {
                         command_rx,
                         MarketSender::new(event_tx, context),
                         history_rx,
+                        shared_history_rx,
+                        source_demand_rx,
                         server,
                     )
                 })
                 .map_err(|_| LocalMarketClientError::ThreadStart)?;
             Ok(Self {
                 history_commands: history_tx,
+                shared_history_commands: shared_history_tx,
+                source_demands,
                 commands: command_tx,
                 events: event_rx,
                 worker: Some(worker),
@@ -145,6 +189,12 @@ mod native {
                 .map_err(|_| LocalMarketClientError::CommandUnavailable)
         }
 
+        pub(crate) fn update_source_demands(&self, demands: SourceDemands) {
+            if *self.source_demands.borrow() != demands {
+                self.source_demands.send_replace(demands);
+            }
+        }
+
         /// Drains at most `limit` events without blocking the UI thread.
         pub fn load_older(
             &self,
@@ -153,6 +203,16 @@ mod native {
             self.history_commands
                 .try_send(request)
                 .map_err(|_| LocalMarketClientError::CommandUnavailable)
+        }
+
+        pub fn load_shared(&self, request: crate::market::SharedHistoryRequest)
+            -> Result<(), LocalMarketClientError> {
+            self.shared_history_commands.send_timeout(request, COMMAND_SEND_TIMEOUT)
+                .map_err(|_| LocalMarketClientError::CommandUnavailable)
+        }
+
+        pub(crate) fn source_requested(&self, request: &crate::market::SharedHistoryRequest) -> bool {
+            source_is_requested(&self.source_demands.borrow(), &request.binding, request.interval)
         }
 
         #[cfg(any(test, feature = "preview"))]
@@ -320,6 +380,8 @@ mod native {
         command_rx: Receiver<LocalMarketCommand>,
         event_tx: MarketSender,
         history_rx: Receiver<crate::market::HistoryRequest>,
+        shared_history_rx: Receiver<crate::market::SharedHistoryRequest>,
+        source_demands: tokio::sync::watch::Receiver<SourceDemands>,
         server: crate::model::MarketServer,
     ) {
         let runtime = match Builder::new_multi_thread()
@@ -336,9 +398,11 @@ mod native {
             }
         };
         if server == crate::model::MarketServer::Binance {
-            runtime.block_on(supervisor(command_rx, event_tx, history_rx));
+            runtime.block_on(supervisor(command_rx, event_tx, history_rx, shared_history_rx,
+                source_demands));
         } else {
-            runtime.block_on(multi::run(server, command_rx, event_tx, history_rx));
+            runtime.block_on(multi::run(server, command_rx, event_tx, history_rx, shared_history_rx,
+                source_demands));
         }
         runtime.shutdown_background();
     }
@@ -347,6 +411,8 @@ mod native {
         command_rx: Receiver<LocalMarketCommand>,
         event_tx: MarketSender,
         history_rx: Receiver<crate::market::HistoryRequest>,
+        shared_history_rx: Receiver<crate::market::SharedHistoryRequest>,
+        mut source_demands: tokio::sync::watch::Receiver<SourceDemands>,
     ) {
         let (async_tx, mut async_rx) = mpsc::channel(COMMAND_CAPACITY);
         let bridge = tokio::task::spawn_blocking(move || {
@@ -373,6 +439,8 @@ mod native {
             }
         };
         history::start(http.clone(), history_rx, event_tx.clone());
+        history::start_shared(http.clone(), shared_history_rx, event_tx.clone(),
+            source_demands.clone());
         let proxy = ProxySetting::from_environment(MARKET_RELAY_HOST);
         let _ = event_tx.try_send(LocalMarketClientEvent::ProxyDetected(proxy.configured()));
         let (catalog_tx, catalog) = tokio::sync::watch::channel(Vec::<Symbol>::new());
@@ -387,6 +455,7 @@ mod native {
                         .iter()
                         .map(|instrument| MarketInstrument {
                             symbol: instrument.symbol.to_string(),
+                            price_tick: Some(instrument.price_tick),
                             price_scale: instrument.price_tick.scale(),
                             quantity_scale: instrument.quantity_step.scale(),
                         })
@@ -415,6 +484,7 @@ mod native {
             }
         });
         let mut pending = None;
+        let mut initial_history = history::InitialHistoryCache::default();
         loop {
             let mut command = match pending.take() {
                 Some(command) => command,
@@ -449,6 +519,8 @@ mod native {
                         &catalog,
                         &mut async_rx,
                         &event_tx,
+                        &mut initial_history,
+                        &mut source_demands,
                     )
                     .await;
                 }
@@ -466,10 +538,14 @@ mod native {
         catalog: &tokio::sync::watch::Receiver<Vec<Symbol>>,
         commands: &mut mpsc::Receiver<LocalMarketCommand>,
         event_tx: &MarketSender,
+        initial_history: &mut history::InitialHistoryCache,
+        source_demands: &mut tokio::sync::watch::Receiver<SourceDemands>,
     ) -> Option<LocalMarketCommand> {
+        let mut open_interest = None;
         let mut attempt = 0_u32;
         let mut emitter = EventEmitter::new(event_tx.clone());
         loop {
+            let source_snapshot = source_demands.borrow_and_update().clone();
             if let Err(error) = multi::ensure_clock(http).await {
                 if let Some(command) = retry_after_error(
                     generation,
@@ -486,14 +562,43 @@ mod native {
                 attempt = attempt.saturating_add(1);
                 continue;
             }
+            // Cache freshness requires the same synchronized public clock as the
+            // history parser. Starting before it would turn a warm restart into
+            // another full OI history request.
+            if open_interest.is_none() {
+                open_interest = Some(open_interest::start(generation, &selections,
+                    http.clone(), event_tx.clone()));
+            }
             if let Err(error) =
                 emitter.status_all(generation, &selections, MarketStatus::LoadingHistory, None)
             {
                 return worker_failure(event_tx, error);
             }
-            match load_history(generation, &selections, http, commands, &mut emitter).await {
-                AttemptResult::Interrupted(command) => return Some(command),
-                AttemptResult::Failed(error) => {
+            let (market_url, public_url) = combined_stream_urls(&selections, &source_snapshot);
+            // Open both existing public connections while the history request is in flight.
+            // Frames buffer in the sockets until the closed-bar baseline has been applied.
+            let (history_result, (public_connection, market_connection)) = tokio::select! {
+                biased;
+                command = commands.recv() => return command,
+                changed = source_demands.changed() => {
+                    if changed.is_err() { return None; }
+                    continue;
+                },
+                result = async {
+                    tokio::join!(
+                        load_history(generation, &selections, http, &mut emitter, initial_history,
+                            &source_snapshot),
+                        async {
+                            tokio::join!(
+                                timeout(CONNECT_BUDGET, connect_binance_websocket(&public_url, websocket_config(), proxy)),
+                                timeout(CONNECT_BUDGET, connect_binance_websocket(&market_url, websocket_config(), proxy)),
+                            )
+                        },
+                    )
+                } => result,
+            };
+            match history_result {
+                Err(error) => {
                     if let Some(command) = retry_after_error(
                         generation,
                         &selections,
@@ -509,22 +614,13 @@ mod native {
                     attempt = attempt.saturating_add(1);
                     continue;
                 }
-                AttemptResult::Completed(()) => {}
+                Ok(()) => {}
             }
             if let Err(error) =
                 emitter.status_all(generation, &selections, MarketStatus::Connecting, None)
             {
                 return worker_failure(event_tx, error);
             }
-            let (market_url, public_url) = combined_stream_urls(&selections);
-            let public_connection = tokio::select! {
-                command = commands.recv() => return command,
-                result = timeout(CONNECT_BUDGET, connect_binance_websocket(
-                    &public_url,
-                    websocket_config(),
-                    proxy,
-                )) => result,
-            };
             let mut public_websocket = match public_connection {
                 Ok(Ok(websocket)) => websocket,
                 Ok(Err(error)) => {
@@ -559,14 +655,6 @@ mod native {
                     attempt = attempt.saturating_add(1);
                     continue;
                 }
-            };
-            let market_connection = tokio::select! {
-                command = commands.recv() => return command,
-                result = timeout(CONNECT_BUDGET, connect_binance_websocket(
-                    &market_url,
-                    websocket_config(),
-                    proxy,
-                )) => result,
             };
             let mut market_websocket = match market_connection {
                 Ok(Ok(websocket)) => websocket,
@@ -624,9 +712,15 @@ mod native {
             heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             let mut last_public_pong = Instant::now();
             let mut last_market_pong = Instant::now();
+            let mut demand_changed = false;
             let session_error = loop {
                 tokio::select! {
                     command = commands.recv() => return command,
+                    changed = source_demands.changed() => {
+                        if changed.is_err() { return None; }
+                        demand_changed = true;
+                        break String::new();
+                    }
                     result = &mut clock_recovery => {
                         if let Err(error) = result {
                             break error;
@@ -662,6 +756,7 @@ mod native {
                                     &selections,
                                     &catalog.borrow(),
                                     received_ms,
+                                    &source_snapshot,
                                     &mut emitter,
                                 ) {
                                     break error;
@@ -705,6 +800,7 @@ mod native {
                                     &selections,
                                     &catalog.borrow(),
                                     received_ms,
+                                    &source_snapshot,
                                     &mut emitter,
                                 ) {
                                     break error;
@@ -734,6 +830,7 @@ mod native {
                     }
                 }
             };
+            if demand_changed { continue; }
             if let Some(command) = retry_after_error(
                 generation,
                 &selections,
@@ -951,33 +1048,88 @@ mod native {
         generation: u64,
         selections: &[MarketSelection],
         http: &reqwest::Client,
-        commands: &mut mpsc::Receiver<LocalMarketCommand>,
         emitter: &mut EventEmitter,
-    ) -> AttemptResult<()> {
-        // Same requests and bar limits, at most two in flight; deliver each chart as it finishes.
-        let mut requests = history::batch(futures_util::stream::iter(selections.iter().map(
-            |selection| async move {
-                (
-                    selection,
-                    fetch_history(http, selection, generation, DEFAULT_HISTORY_LIMIT, None).await,
-                )
+        cache: &mut history::InitialHistoryCache,
+        source_demands: &SourceDemands,
+    ) -> Result<(), String> {
+        // A recently viewed chart reuses its real closed bars. Only the missing tail
+        // needs REST; a still-current cache uses no additional exchange request.
+        let planned = selections
+            .iter()
+            .map(|selection| {
+                let disk = public_cache::PublicHistoryCache::local();
+                let cached = cache.get(selection).map(<[PublicBar]>::to_vec)
+                    .or_else(|| disk.as_ref()?.recent(selection, generation))
+                    .map(|bars| bars.into_iter().rev().take(INITIAL_VISIBLE_HISTORY_LIMIT)
+                        .collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>());
+                (selection, cached)
+            })
+            .collect::<Vec<_>>();
+        for (selection, cached) in &planned {
+            let Some(cached) = cached else { continue; };
+            if history::missing_limit(Some(cached), selection.interval, now_ms()) == 0
+                || !cache.preview_once(selection, generation) { continue; }
+            let bars = history::merge_latest(Some(cached.clone()), Vec::new(), generation);
+            let received_ms = now_ms();
+            let event_time_ms = bars.last()
+                .map_or(received_ms, |bar| bar.close_time_ms.min(received_ms));
+            emitter.emit(LocalMarketClientEvent::Market(Box::new(MarketEnvelope {
+                generation, selection: (*selection).clone(), event_time_ms, received_ms,
+                payload: MarketPayload::RestHistory { bars },
+            })))?;
+        }
+        let mut requests = history::batch(futures_util::stream::iter(planned.into_iter().map(
+            |(selection, cached)| async move {
+                let limit = history::missing_limit(cached.as_deref(), selection.interval, now_ms());
+                let result = if limit == 0 {
+                    let bars = history::merge_latest(cached, Vec::new(), generation);
+                    let received_ms = now_ms();
+                    let event_time_ms = bars
+                        .last()
+                        .map_or(received_ms, |bar| bar.close_time_ms.min(received_ms));
+                    Ok((bars, None, received_ms, event_time_ms))
+                } else {
+                    fetch_history(http, selection, generation, limit, None)
+                        .await
+                        .map(|(fresh, forming, received_ms, _)| {
+                            let bars = history::merge_latest(cached, fresh, generation);
+                            let event_time_ms = bars
+                                .last()
+                                .map_or(received_ms, |bar| bar.close_time_ms.min(received_ms));
+                            (bars, forming, received_ms, event_time_ms)
+                        })
+                };
+                let result = match result {
+                    Ok((mut bars, forming, received_ms, event_time_ms)) => {
+                        if bars.len() < INITIAL_VISIBLE_HISTORY_LIMIT
+                            && let Some(first) = bars.first().map(|bar| bar.open_time_ms)
+                            && first > 0
+                        {
+                            let needed = INITIAL_VISIBLE_HISTORY_LIMIT - bars.len();
+                            if let Ok((older, _, _, _)) = fetch_history(http, selection, generation, needed,
+                                Some(first)).await {
+                                bars = history::merge_latest(Some(older), bars, generation)
+                                    .into_iter().rev().take(INITIAL_VISIBLE_HISTORY_LIMIT)
+                                    .collect::<Vec<_>>().into_iter().rev().collect();
+                            }
+                        }
+                        Ok((bars, forming, received_ms, event_time_ms))
+                    }
+                    Err(error) => Err(error),
+                };
+                (selection, result)
             },
         )));
 
-        while let Some((selection, history)) = tokio::select! {
-            biased;
-            command = commands.recv() => {
-                return match command {
-                    Some(command) => AttemptResult::Interrupted(command),
-                    None => AttemptResult::Failed("local market command bridge ended".to_owned()),
-                };
-            }
-            result = requests.next() => result,
-        } {
-            let (bars, received_ms, event_time_ms) = match history {
+        while let Some((selection, history)) = requests.next().await {
+            let (bars, forming, received_ms, event_time_ms) = match history {
                 Ok(history) => history,
-                Err(error) => return AttemptResult::Failed(error),
+                Err(error) => return Err(error),
             };
+            cache.remember(selection, &bars);
+            if let Some(disk) = public_cache::PublicHistoryCache::local() {
+                disk.remember_recent(selection, &bars);
+            }
             let envelope = MarketEnvelope {
                 generation,
                 selection: selection.clone(),
@@ -986,10 +1138,105 @@ mod native {
                 payload: MarketPayload::RestHistory { bars },
             };
             if let Err(error) = emitter.emit(LocalMarketClientEvent::Market(Box::new(envelope))) {
-                return AttemptResult::Failed(error);
+                return Err(error);
+            }
+            if let Some(study_bar) = forming {
+                let bar = UiBar {
+                    open_time_ms: study_bar.open_time_ms,
+                    open: study_bar.open.value(),
+                    high: study_bar.high.value(),
+                    low: study_bar.low.value(),
+                    close: study_bar.close.value(),
+                    volume: match study_bar.base_volume {
+                        FieldState::Known(volume) => Some(volume),
+                        FieldState::Unavailable { .. } => None,
+                        _ => return Err("forming history volume unknown".to_owned()),
+                    },
+                };
+                let envelope = MarketEnvelope {
+                    generation,
+                    selection: selection.clone(),
+                    event_time_ms: received_ms,
+                    received_ms,
+                    payload: MarketPayload::WsBar {
+                        bar,
+                        study_bar: Box::new(study_bar),
+                        closed: false,
+                    },
+                };
+                if let Err(error) = emitter.emit(LocalMarketClientEvent::Market(Box::new(envelope)))
+                {
+                    return Err(error);
+                }
             }
         }
-        AttemptResult::Completed(())
+        // One hidden 1m dependency per exact market binding, shared by every display interval.
+        // A visible 1m chart already populated this cache and needs no second REST request.
+        let bases = selections.iter().map(|selection| selection.binding.clone())
+            .collect::<BTreeSet<_>>().into_iter().filter(|binding|
+                source_demands.get(binding).map_or(true, |demand| demand.minute)).map(|binding| {
+                let selection = MarketSelection { binding, interval: ChartInterval::OneMinute };
+                let cached = cache.shared_minutes(&selection.binding)
+                    .or_else(|| cache.get(&selection)).map(<[PublicBar]>::to_vec)
+                    .or_else(|| public_cache::PublicHistoryCache::local()?.recent(&selection, generation));
+                (selection, cached)
+            }).collect::<Vec<_>>();
+        let mut base_requests = history::batch(futures_util::stream::iter(bases.into_iter().map(
+            |(selection, cached)| async move {
+                let limit = history::missing_limit(cached.as_deref(), ChartInterval::OneMinute, now_ms());
+                let result = if limit == 0 {
+                    Ok((history::merge_shared_minutes(cached, Vec::new(), generation), None))
+                } else {
+                    fetch_history(http, &selection, generation, limit, None).await
+                        .map(|(fresh, forming, _, _)| (history::merge_shared_minutes(cached, fresh, generation), forming))
+                };
+                (selection, result)
+            },
+        )));
+        while let Some((selection, result)) = base_requests.next().await {
+            let (bars, forming) = match result {
+                Ok(value) => value,
+                Err(error) => {
+                    tracing::warn!(symbol = %selection.binding.symbol, %error, "shared 1m history unavailable");
+                    continue;
+                }
+            };
+            cache.remember_shared_minutes(&selection.binding, &bars);
+            if let Some(disk) = public_cache::PublicHistoryCache::local() {
+                disk.remember_recent(&selection, &bars);
+            }
+            emitter.emit(LocalMarketClientEvent::BaseMinuteHistory {
+                generation, binding: selection.binding, bars, forming,
+            })?;
+        }
+        let day_selections = selections.iter().map(|selection| selection.binding.clone())
+            .collect::<BTreeSet<_>>();
+        for binding in day_selections {
+            if source_demands.get(&binding).is_some_and(|demand| !demand.day) { continue; }
+            let selection = MarketSelection { binding: binding.clone(), interval: ChartInterval::OneDay };
+            let cached = cache.get(&selection).map(<[PublicBar]>::to_vec)
+                .or_else(|| public_cache::PublicHistoryCache::local()?.recent(&selection, generation));
+            let missing = history::missing_limit(cached.as_deref(), ChartInterval::OneDay, now_ms());
+            let (bars, forming) = if missing == 0 {
+                (history::merge_latest(cached, Vec::new(), generation), None)
+            } else {
+                match fetch_history(http, &selection, generation, missing.min(32), None).await {
+                    Ok((fresh, forming, _, _)) => (history::merge_latest(cached, fresh, generation), forming),
+                    Err(error) => {
+                        tracing::warn!(symbol = %binding.symbol, %error, "shared 1d history unavailable");
+                        continue;
+                    }
+                }
+            };
+            cache.remember(&selection, &bars);
+            if let Some(disk) = public_cache::PublicHistoryCache::local() {
+                disk.remember_recent(&selection, &bars);
+            }
+            let days = bars.into_iter().rev().take(500).collect::<Vec<_>>()
+                .into_iter().rev().collect();
+            emitter.emit(LocalMarketClientEvent::SessionDayHistory { generation, binding, bars: days, forming })?;
+        }
+        Ok(())
     }
 
     async fn fetch_history(
@@ -998,7 +1245,27 @@ mod native {
         generation: u64,
         limit: usize,
         before: Option<u64>,
-    ) -> Result<(Vec<PublicBar>, u64, u64), String> {
+    ) -> Result<(Vec<PublicBar>, Option<PublicBar>, u64, u64), String> {
+        fetch_history_inner(http, selection, generation, limit, before, None).await
+    }
+
+    async fn fetch_history_inner(
+        http: &reqwest::Client,
+        selection: &MarketSelection,
+        generation: u64,
+        limit: usize,
+        before: Option<u64>,
+        gap_after: Option<u64>,
+    ) -> Result<(Vec<PublicBar>, Option<PublicBar>, u64, u64), String> {
+        if let Some(before) = before
+            && let Some(bars) = public_cache::PublicHistoryCache::local()
+                .and_then(|cache| cache.page(selection, before, generation))
+            && crate::market::history_page_covers_gap(&bars, before, gap_after)
+        {
+            let received_ms = now_ms();
+            let event_time_ms = bars.last().map_or(received_ms, |bar| bar.close_time_ms.min(received_ms));
+            return Ok((bars, None, received_ms, event_time_ms));
+        }
         let url = history::url(selection, limit, before)?;
         let response = http
             .get(url)
@@ -1034,7 +1301,7 @@ mod native {
             std::str::from_utf8(&body).map_err(|_| "history response was not UTF-8".to_owned())?;
         let received_ms = now_ms();
         let interval = binance_interval(selection.interval);
-        let bars = parse_public_market_rest_klines(
+        let (bars, forming) = parse_public_market_rest_klines_with_forming(
             payload,
             &selection.binding,
             generation,
@@ -1042,10 +1309,14 @@ mod native {
             interval,
         )
         .map_err(|error| format!("history parse failed: {error}"))?;
+        if let Some(disk) = public_cache::PublicHistoryCache::local() {
+            if let Some(before) = before { disk.remember_page(selection, before, &bars); }
+            else { disk.remember_recent(selection, &bars); }
+        }
         let event_time_ms = bars
             .last()
             .map_or(received_ms, |bar| bar.close_time_ms.min(received_ms));
-        Ok((bars, received_ms, event_time_ms))
+        Ok((bars, forming, received_ms, event_time_ms))
     }
 
     async fn retry_after_error(
@@ -1075,6 +1346,7 @@ mod native {
         selections: &[MarketSelection],
         catalog: &[Symbol],
         received_ms: u64,
+        source_demands: &SourceDemands,
         emitter: &mut EventEmitter,
     ) -> Result<(), String> {
         if payload.contains("\"stream\":\"!ticker@arr\"") {
@@ -1100,6 +1372,34 @@ mod native {
                 .collect();
             emitter.emit(LocalMarketClientEvent::Quotes(quotes))?;
             return Ok(());
+        }
+        for binding in selections.iter().map(|selection| selection.binding.clone()).collect::<BTreeSet<_>>() {
+            let demand = source_demands.get(&binding).copied()
+                .unwrap_or(SharedSourceDemand { minute: true, day: true });
+            if let Ok(kline) = parse_public_market_kline(payload, &binding, generation, received_ms) {
+                let normalized = match kline {
+                    BinancePublicKline::Forming(envelope) => {
+                        let fact = envelope.into_fact();
+                        matches!(fact.interval, BinanceKlineInterval::OneMinute | BinanceKlineInterval::OneDay)
+                            .then(|| (study_bar_from_forming(fact), false))
+                    }
+                    BinancePublicKline::Closed(envelope) => {
+                        let fact = envelope.into_fact();
+                        [60_000, 86_400_000].contains(&fact.interval_ms).then_some((fact, true))
+                    }
+                };
+                if let Some((bar, confirmed)) = normalized {
+                    if bar.interval_ms == 60_000 && demand.minute {
+                        emitter.emit(LocalMarketClientEvent::BaseMinuteBar {
+                            generation, binding, bar, confirmed,
+                        })?;
+                    } else if bar.interval_ms == 86_400_000 && demand.day {
+                        emitter.emit(LocalMarketClientEvent::SessionDayBar {
+                            generation, binding, bar, confirmed,
+                        })?;
+                    }
+                }
+            }
         }
         for selection in selections {
             if let Ok(kline) =
@@ -1136,6 +1436,19 @@ mod native {
                         study_bar: Box::new(study_bar),
                         closed,
                     },
+                })))?;
+                continue;
+            }
+            if let Ok(envelope) =
+                parse_public_mark_funding(payload, &selection.binding, generation, received_ms)
+            {
+                let event_time_ms = envelope.exchange_event_time_ms();
+                emitter.emit(LocalMarketClientEvent::Market(Box::new(MarketEnvelope {
+                    generation,
+                    selection: selection.clone(),
+                    event_time_ms,
+                    received_ms,
+                    payload: MarketPayload::Funding(envelope.into_fact()),
                 })))?;
                 continue;
             }
@@ -1249,12 +1562,6 @@ mod native {
         }
     }
 
-    enum AttemptResult<T> {
-        Completed(T),
-        Interrupted(LocalMarketCommand),
-        Failed(String),
-    }
-
     fn worker_failure(events: &MarketSender, error: String) -> Option<LocalMarketCommand> {
         let _ = events.try_send(LocalMarketClientEvent::WorkerFailed(error));
         Some(LocalMarketCommand::Stop)
@@ -1274,15 +1581,19 @@ mod native {
         ))
     }
 
-    fn combined_stream_urls(selections: &[MarketSelection]) -> (String, String) {
+    fn combined_stream_urls(selections: &[MarketSelection], source_demands: &SourceDemands)
+        -> (String, String) {
         let mut market_streams = vec!["!ticker@arr".to_owned()];
         let mut public_streams = Vec::new();
         for selection in selections {
             let symbol = native_symbol(&selection.binding.symbol).to_ascii_lowercase();
-            for stream in [
-                format!("{symbol}@kline_{}", selection.interval.label()),
-                format!("{symbol}@aggTrade"),
-            ] {
+            let demand = source_demands.get(&selection.binding).copied()
+                .unwrap_or(SharedSourceDemand { minute: true, day: true });
+            let mut streams = vec![format!("{symbol}@kline_{}", selection.interval.label())];
+            if demand.minute { streams.push(format!("{symbol}@kline_1m")); }
+            if demand.day { streams.push(format!("{symbol}@kline_1d")); }
+            streams.extend([format!("{symbol}@aggTrade"), format!("{symbol}@markPrice@1s")]);
+            for stream in streams {
                 if !market_streams.contains(&stream) {
                     market_streams.push(stream);
                 }
@@ -1326,21 +1637,22 @@ mod native {
             high: bar.high.value(),
             low: bar.low.value(),
             close: bar.close.value(),
-            volume: bar.base_volume,
+            volume: Some(bar.base_volume),
         }
     }
 
     fn ui_bar_from_closed(bar: &PublicBar) -> Result<UiBar, String> {
-        let FieldState::Known(volume) = &bar.base_volume else {
-            return Err("normalized bar has no known base volume".to_owned());
-        };
         Ok(UiBar {
             open_time_ms: bar.open_time_ms,
             open: bar.open.value(),
             high: bar.high.value(),
             low: bar.low.value(),
             close: bar.close.value(),
-            volume: *volume,
+            volume: match &bar.base_volume {
+                FieldState::Known(volume) => Some(*volume),
+                FieldState::Unavailable { .. } => None,
+                _ => return Err("normalized bar has unknown base volume".to_owned()),
+            },
         })
     }
 
@@ -1502,10 +1814,10 @@ mod native {
             let (sender, receiver) = crossbeam_channel::bounded(8);
             let mut emitter = EventEmitter::new(sender);
             let invalid = r#"{"stream":"!ticker@arr","data":[{"e":"24hrTicker","s":"BTCUSDT","E":1000,"c":"0","P":"0","q":"10"}]}"#;
-            dispatch_payload(invalid, 1, &[], &catalog, 1001, &mut emitter)?;
+            dispatch_payload(invalid, 1, &[], &catalog, 1001, &SourceDemands::new(), &mut emitter)?;
             assert!(receiver.is_empty());
             let valid = invalid.replace("\"c\":\"0\"", "\"c\":\"100\"");
-            dispatch_payload(&valid, 1, &[], &catalog, 1001, &mut emitter)?;
+            dispatch_payload(&valid, 1, &[], &catalog, 1001, &SourceDemands::new(), &mut emitter)?;
             assert!(receiver.try_iter().any(|event| matches!(event,
                 LocalMarketClientEvent::Quotes(quotes) if quotes.len() == 1 && quotes[0].last == rust_decimal::Decimal::from(100)
             )));
@@ -1531,10 +1843,10 @@ mod native {
         #[test]
         fn separates_market_and_public_stream_paths() -> Result<(), String> {
             let selection = selection("ETH/USDT", ChartInterval::OneHour)?;
-            let (market, public) = combined_stream_urls(&[selection]);
+            let (market, public) = combined_stream_urls(&[selection], &SourceDemands::new());
             assert_eq!(
                 market,
-                "wss://clawdbotweb.site/market/stream?streams=!ticker@arr/ethusdt@kline_1h/ethusdt@aggTrade"
+                "wss://clawdbotweb.site/market/stream?streams=!ticker@arr/ethusdt@kline_1h/ethusdt@kline_1m/ethusdt@kline_1d/ethusdt@aggTrade/ethusdt@markPrice@1s"
             );
             assert_eq!(
                 public,
@@ -1547,11 +1859,38 @@ mod native {
         fn combined_stream_deduplicates_shared_symbol_facts() -> Result<(), String> {
             let one_minute = selection("BTC/USDT", ChartInterval::OneMinute)?;
             let five_minutes = selection("BTC/USDT", ChartInterval::FiveMinutes)?;
-            let (market, public) = combined_stream_urls(&[one_minute, five_minutes]);
+            let (market, public) = combined_stream_urls(&[one_minute, five_minutes], &SourceDemands::new());
             assert_eq!(public.matches("btcusdt@bookTicker").count(), 1);
             assert_eq!(market.matches("btcusdt@aggTrade").count(), 1);
+            assert_eq!(market.matches("btcusdt@markPrice@1s").count(), 1);
             assert_eq!(public.matches("btcusdt@depth20@100ms").count(), 1);
-            assert_eq!(market.matches("btcusdt@kline_").count(), 2);
+            assert_eq!(market.matches("btcusdt@kline_").count(), 3);
+            Ok(())
+        }
+
+        #[test]
+        fn hidden_sources_follow_actual_indicator_demand() -> Result<(), String> {
+            let mut settings = crate::chart_settings::ChartDisplaySettings::default();
+            let default = SharedSourceDemand::for_chart(&settings, false);
+            assert!(default.minute && default.day);
+            settings.microstructure.heatmap = false;
+            settings.session.pdh = false;
+            settings.session.pdl = false;
+            assert_eq!(SharedSourceDemand::for_chart(&settings, false), SharedSourceDemand::default());
+            assert!(SharedSourceDemand::for_chart(&settings, true).minute);
+            settings.session.daily_pivot = true;
+            assert!(SharedSourceDemand::for_chart(&settings, false).day);
+
+            let visible = selection("DOGE/USDC", ChartInterval::FiveMinutes)?;
+            let mut demand = SourceDemands::new();
+            demand.insert(visible.binding.clone(), SharedSourceDemand::default());
+            let (market, _) = combined_stream_urls(&[visible.clone()], &demand);
+            assert!(market.contains("dogeusdc@kline_5m"));
+            assert!(!market.contains("dogeusdc@kline_1m"));
+            assert!(!market.contains("dogeusdc@kline_1d"));
+            let minute = selection("DOGE/USDC", ChartInterval::OneMinute)?;
+            let (market, _) = combined_stream_urls(&[minute], &demand);
+            assert_eq!(market.matches("dogeusdc@kline_1m").count(), 1);
             Ok(())
         }
 
@@ -1588,7 +1927,7 @@ mod native {
             let study = study_bar_from_forming(bar);
             assert_eq!(ui.open_time_ms, 60_000);
             assert_eq!(ui.close, Decimal::new(105, 0));
-            assert_eq!(ui.volume, Decimal::new(12, 0));
+            assert_eq!(ui.volume, Some(Decimal::new(12, 0)));
             assert!(study.is_valid());
             Ok(())
         }

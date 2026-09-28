@@ -2,12 +2,14 @@
 
 import { useCallback, useEffect, useRef, useState, type FormEvent } from "react";
 import { api, messages, RequestError } from "@/lib/customer-api";
+import { FollowSizingFields, authorizationFromForm } from "./follow-sizing-fields";
+import { percentToRatio } from "@/lib/follow-sizing";
 import { ManagedFollowSettingsPanel } from "./managed-follow-settings";
 
 type Account = { managed_id: string; label: string; masked_key: string; verification: string; verified_ms: number | null; equity: string | null; available_margin: string | null; balance_observed_ms: number | null };
 type Overview = { can_manage: boolean; accounts: Account[] };
-type Draft = { id: string; label: string; key: string; secret: string; sizing: "proportional" | "fixed_notional"; multiplier: string; fixedNotional: string; status: "editing" | "uncertain" | "saved"; message: string };
-const draft = (): Draft => ({ id: crypto.randomUUID(), label: "", key: "", secret: "", sizing: "proportional", multiplier: "1", fixedNotional: "", status: "editing", message: "" });
+type Draft = { id: string; label: string; key: string; secret: string; sizing: "proportional" | "source_ratio" | "fixed_notional"; sourcePercent: string; multiplier: string; fixedNotional: string; status: "editing" | "uncertain" | "saved"; message: string };
+const draft = (): Draft => ({ id: crypto.randomUUID(), label: "", key: "", secret: "", sizing: "proportional", sourcePercent: "50", multiplier: "1", fixedNotional: "", status: "editing", message: "" });
 const verification: Record<string, string> = { unverified: "未验证", verified: "验证通过", invalid_credentials: "密钥无效", permission_denied: "权限不符", mode_mismatch: "账户模式不符", network_unavailable: "验证暂不可用，可稍后重试", account_conflict: "账户已绑定其他身份" };
 const balance = (value: string | null) => value === null ? "—" : `${value} USD`;
 
@@ -20,13 +22,16 @@ export function ManagedFollowersPanel({ csrf }: { csrf: string }) {
   const gate = useRef(false);
   const alive = useRef(true);
   const dialog = useRef<HTMLDialogElement>(null);
+  const verifyDialog = useRef<HTMLDialogElement>(null);
+  const [verifyAccount, setVerifyAccount] = useState<Account | null>(null);
+  const [changeAuthorization, setChangeAuthorization] = useState(false);
   const refresh = useCallback(async () => {
     try { const value = await api<Overview>("managed-followers"); if (alive.current) { setOverview(value); setError(""); } }
     catch (cause) { if (alive.current) { setError(cause instanceof Error ? cause.message : messages.unavailable); setOverview(previous => previous ? { ...previous, can_manage: false } : null); } }
   }, []);
   useEffect(() => { alive.current = true; void refresh(); return () => { alive.current = false; }; }, [refresh]);
   function close() { if (!gate.current) { dialog.current?.close(); setRows([]); } }
-  function edit(id: string, field: "label" | "key" | "secret" | "sizing" | "multiplier" | "fixedNotional", value: string) {
+  function edit(id: string, field: "label" | "key" | "secret" | "sizing" | "multiplier" | "fixedNotional" | "sourcePercent", value: string) {
     setRows(previous => previous.map(row => row.id === id ? { ...row, [field]: value, message: "" } : row));
   }
   async function save(event: FormEvent) {
@@ -37,8 +42,8 @@ export function ManagedFollowersPanel({ csrf }: { csrf: string }) {
     try {
       for (const row of pendingRows) {
         try {
-          const sizing = row.sizing === "fixed_notional" ? { mode: "fixed_notional", notional: row.fixedNotional.trim() } : { mode: "proportional" };
-          await api<Account>("managed-followers", csrf, { request_id: row.id, label: row.label.trim(), key: row.key, secret: row.secret, authorization: { sizing, multiplier: row.sizing === "fixed_notional" ? "1" : row.multiplier.trim() } });
+          const sizing = row.sizing === "source_ratio" ? { mode: "source_ratio", ratio: percentToRatio(row.sourcePercent) } : row.sizing === "fixed_notional" ? { mode: "fixed_notional", notional: row.fixedNotional.trim() } : { mode: "proportional" };
+          await api<Account>("managed-followers", csrf, { request_id: row.id, label: row.label.trim(), key: row.key, secret: row.secret, authorization: { sizing, multiplier: row.sizing !== "proportional" ? "1" : row.multiplier.trim() } });
           count++;
           if (!alive.current) return;
           setRows(previous => previous.map(item => item.id === row.id ? { ...item, key: "", secret: "", status: "saved", message: "已加密保存" } : item));
@@ -55,15 +60,26 @@ export function ManagedFollowersPanel({ csrf }: { csrf: string }) {
       if (count === pendingRows.length && alive.current) { dialog.current?.close(); setRows([]); }
     } finally { gate.current = false; if (alive.current) setBusy(false); }
   }
-  async function verify(account: Account) {
+  async function verify(account: Account, authorization?: ReturnType<typeof authorizationFromForm>) {
     if (gate.current) return;
     gate.current = true; setBusy(true); setError(""); setNotice("");
     try {
-      const result = await api<Account>("managed-verify", csrf, { managed_id: account.managed_id });
+      const result = await api<Account>("managed-verify", csrf, { managed_id: account.managed_id, ...(authorization ? { authorization } : {}) });
       if (alive.current) setNotice(`${account.label}：${verification[result.verification] ?? "状态未知"}；权益 ${balance(result.equity)}，可用保证金 ${balance(result.available_margin)}`);
       await refresh();
+      verifyDialog.current?.close();
     } catch (cause) { if (alive.current) setError(cause instanceof Error ? cause.message : messages.unavailable); }
     finally { gate.current = false; if (alive.current) setBusy(false); }
+  }
+  function beginVerify(account: Account) {
+    if (account.verification === "verified") { void verify(account); return; }
+    setVerifyAccount(account); setChangeAuthorization(false); setError(""); verifyDialog.current?.showModal();
+  }
+  function submitVerify(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (!verifyAccount) return;
+    try { void verify(verifyAccount, changeAuthorization ? authorizationFromForm(new FormData(event.currentTarget)) : undefined); }
+    catch (cause) { setError(cause instanceof Error ? cause.message : messages.unavailable); }
   }
   async function remove(account: Account) {
     if (gate.current) return;
@@ -83,7 +99,17 @@ export function ManagedFollowersPanel({ csrf }: { csrf: string }) {
     {notice && <p role="status" className="notice">{notice}</p>}
     <div className="buttons"><button className="primary" disabled={busy || !overview?.can_manage || overview.accounts.length >= 200} onClick={() => { setRows([draft()]); dialog.current?.showModal(); }}>添加托管 API密钥</button><button disabled={busy} onClick={() => void refresh()}>刷新托管账户</button></div>
     {overview?.accounts.length === 0 && <p className="muted">尚未添加托管账户。点击上方按钮开始保存。</p>}
-    {overview && overview.accounts.length > 0 && <div className="table"><table><thead><tr><th>账户标签</th><th>API密钥</th><th>验证状态</th><th>账户权益</th><th>可用保证金</th><th>跟单</th><th>操作</th></tr></thead><tbody>{overview.accounts.map(account => <tr key={account.managed_id}><td>{account.label}</td><td>{account.masked_key}</td><td>{verification[account.verification] ?? "状态未知"}</td><td>{balance(account.equity)}</td><td>{balance(account.available_margin)}</td><td><ManagedFollowSettingsPanel managedId={account.managed_id} label={account.label} csrf={csrf} canManage={overview.can_manage} equity={account.equity} /></td><td><button disabled={busy || !overview.can_manage} onClick={() => void verify(account)}>验证权限并申请跟单</button><button disabled={busy || !overview.can_manage} onClick={() => void remove(account)}>删除托管账户</button><p className="muted">立即停跟并移出列表；程序挂单撤销及未决命令对账完成后擦除凭证。</p></td></tr>)}</tbody></table></div>}
+    {overview && overview.accounts.length > 0 && <div className="table"><table><thead><tr><th>账户标签</th><th>API密钥</th><th>验证状态</th><th>账户权益</th><th>可用保证金</th><th>跟单</th><th>操作</th></tr></thead><tbody>{overview.accounts.map(account => <tr key={account.managed_id}><td>{account.label}</td><td>{account.masked_key}</td><td>{verification[account.verification] ?? "状态未知"}</td><td>{balance(account.equity)}</td><td>{balance(account.available_margin)}</td><td><ManagedFollowSettingsPanel managedId={account.managed_id} label={account.label} csrf={csrf} canManage={overview.can_manage} equity={account.equity} /></td><td><button disabled={busy || !overview.can_manage} onClick={() => beginVerify(account)}>验证权限并申请跟单</button><button disabled={busy || !overview.can_manage} onClick={() => void remove(account)}>删除托管账户</button><p className="muted">立即停跟并移出列表；程序挂单撤销及未决命令对账完成后擦除凭证。</p></td></tr>)}</tbody></table></div>}
+    <dialog ref={verifyDialog} className="managed-dialog" aria-labelledby="managed-verify-title" onCancel={event => { if (busy) event.preventDefault(); }}>
+      <h2 id="managed-verify-title">{verifyAccount?.label} · 验证权限并申请跟单</h2>
+      <p>验证通过后将按保存的设置申请跟单。尚未成功验证的账户可在此修改首次跟单方式。</p>
+      {error && <p role="alert" className="notice error">{error}</p>}
+      <form onSubmit={submitVerify}>
+        <fieldset disabled={busy}><button type="button" aria-pressed={changeAuthorization} onClick={() => setChangeAuthorization(value => !value)}>修改首次跟单设置</button>
+        {changeAuthorization && <FollowSizingFields key={verifyAccount?.managed_id} value={{ mode: "source_ratio", ratio: "0.5" }} multiplierName="authorizationMultiplier" />}</fieldset>
+        <div className="buttons"><button className="primary" disabled={busy} type="submit">{busy ? "正在验证…" : "确认设置并验证"}</button><button type="button" disabled={busy} onClick={() => verifyDialog.current?.close()}>取消</button></div>
+      </form>
+    </dialog>
     <dialog ref={dialog} className="managed-dialog" aria-labelledby="managed-title" onCancel={event => { event.preventDefault(); close(); }}>
       <h2 id="managed-title">添加托管 API密钥</h2><p>填写标签、API密钥 和 密钥。支持一次添加多个账户，最多 10 个。</p>
       <p className="muted">KOL 和跟单帐户都必须是币安统一帐户，且开通 U 本位合约，在交易设置中修改为双向持仓。API 设置需要开启统一账户交易。密钥加密保存后只显示掩码。</p>
@@ -93,9 +119,9 @@ export function ManagedFollowersPanel({ csrf }: { csrf: string }) {
           <label>账户标签<input aria-label={`账户 ${index + 1} 标签`} value={row.label} onChange={e => edit(row.id,"label",e.target.value)} required maxLength={64} autoComplete="off" /></label>
           <div className="customer-grid"><label>API密钥<input aria-label={`账户 ${index + 1} API密钥`} type="password" value={row.key} onChange={e => edit(row.id,"key",e.target.value)} required minLength={16} maxLength={256} pattern="[A-Za-z0-9]+" autoComplete="off" spellCheck={false} /></label>
           <label>密钥<input aria-label={`账户 ${index + 1} 密钥`} type="password" value={row.secret} onChange={e => edit(row.id,"secret",e.target.value)} required minLength={16} maxLength={256} pattern="[A-Za-z0-9]+" autoComplete="off" spellCheck={false} /></label>
-          <label>跟单方式<select aria-label={`账户 ${index + 1} 跟单方式`} value={row.sizing} onChange={e => edit(row.id,"sizing",e.target.value)}><option value="proportional">定比跟单</option><option value="fixed_notional">定额跟单</option></select></label>
-          {row.sizing === "proportional" ? <label>跟单倍数<input aria-label={`账户 ${index + 1} 跟单倍数`} inputMode="decimal" value={row.multiplier} onChange={e => edit(row.id,"multiplier",e.target.value)} required /></label> : <label>每笔跟单名义金额（报价币）<input aria-label={`账户 ${index + 1} 每笔金额`} inputMode="decimal" value={row.fixedNotional} onChange={e => edit(row.id,"fixedNotional",e.target.value)} required /></label>}</div>
-          <p className="muted">跟单资金默认使用验证时的账户全部权益，无需填写总跟单金额。定比按账户权益与带单策略资金的比例计算；定额填写订单名义金额，不是保证金。低于交易所最低名义额时会补足。</p>
+          <label>跟单方式<select aria-label={`账户 ${index + 1} 跟单方式`} value={row.sizing} onChange={e => edit(row.id,"sizing",e.target.value)}><option value="proportional">定比跟单</option><option value="source_ratio">按主单比例</option><option value="fixed_notional">定额跟单</option></select></label>
+          {row.sizing === "proportional" ? <label>跟单倍数<input aria-label={`账户 ${index + 1} 跟单倍数`} inputMode="decimal" value={row.multiplier} onChange={e => edit(row.id,"multiplier",e.target.value)} required /></label> : row.sizing === "source_ratio" ? <label>主单比例（%）<input aria-label={`账户 ${index + 1} 主单比例`} inputMode="decimal" value={row.sourcePercent} onChange={e => edit(row.id,"sourcePercent",e.target.value)} required /></label> : <label>每笔跟单名义金额（报价币）<input aria-label={`账户 ${index + 1} 每笔金额`} inputMode="decimal" value={row.fixedNotional} onChange={e => edit(row.id,"fixedNotional",e.target.value)} required /></label>}</div>
+          <p className="muted">跟单资金默认使用验证时的账户全部权益，无需填写总跟单金额。定比按账户权益与带单策略资金的比例计算；定额填写订单名义金额，不是保证金。按主单比例 50% 表示主单 1000U、子单 500U，与余额无关；该方式按步长向下取整，低于最低量时不放大订单。其他方式低于最低名义额时会补足。</p>
           {row.message && <p role="status">{row.message}</p>}
           {rows.length > 1 && row.status === "editing" && <button type="button" onClick={() => setRows(previous => previous.filter(item => item.id !== row.id))}>移除此行</button>}
         </fieldset>)}</div>

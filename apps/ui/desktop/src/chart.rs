@@ -8,8 +8,18 @@ pub const DEFAULT_VISIBLE_BARS: usize = 120;
 pub const MIN_VISIBLE_BARS: usize = 20;
 pub const MAX_VISIBLE_BARS: usize = 400;
 
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct BaseMinuteStudy {
+    pub confirmed: bool,
+    pub bar_vwap: Option<Decimal>,
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ChartStudyPoint {
+    pub custom_scripts: Vec<venue_indicators::chart::script::ScriptFrame>,
+    pub bar_vwap: Option<Decimal>,
+    pub order_flow: venue_indicators::chart::OrderFlowValue,
+    pub open_interest: Option<Decimal>,
     pub custom_ema_adx: Option<venue_indicators::chart::EmaAdxValues>,
     pub open_time_ms: u64,
     pub confirmed: bool,
@@ -114,9 +124,23 @@ impl ChartInterval {
     }
 }
 
+fn local_display_seconds(timestamp_ms: u64) -> i64 {
+    let utc_seconds = i64::try_from(timestamp_ms / 1_000).unwrap_or(i64::MAX);
+    utc_seconds.saturating_add(local_offset_seconds(utc_seconds))
+}
+
+pub(crate) fn format_clock_time(timestamp_ms: u64) -> String {
+    let seconds = local_display_seconds(timestamp_ms).rem_euclid(86_400);
+    format!(
+        "{:02}:{:02}:{:02}",
+        seconds / 3_600,
+        seconds / 60 % 60,
+        seconds % 60
+    )
+}
+
 pub fn format_timeline_label(open_time_ms: u64, interval: ChartInterval) -> String {
-    let utc_seconds = i64::try_from(open_time_ms / 1_000).unwrap_or(i64::MAX);
-    let total_seconds = utc_seconds.saturating_add(local_offset_seconds(utc_seconds));
+    let total_seconds = local_display_seconds(open_time_ms);
     let days = total_seconds.div_euclid(86_400);
     let seconds_of_day = total_seconds.rem_euclid(86_400) as u64;
     let hour = seconds_of_day / 3_600;
@@ -219,7 +243,7 @@ impl ChartViewport {
             .unwrap_or((automatic.low.to_bits(), automatic.high.to_bits()));
         let low = f64::from_bits(low);
         let high = f64::from_bits(high);
-        let center = low + (high - low) * 0.5;
+        let center = (automatic.low + automatic.high) * 0.5;
         let half = (high - low) * 0.5 * f64::from(self.price_zoom_milli.clamp(250, 4000)) / 1000.0;
         PriceRange {
             low: (center - half).max(0.0),
@@ -443,6 +467,22 @@ pub struct PriceRange {
 }
 
 impl PriceRange {
+    /// Expand one shared price transform; never stretch an individual candle away from its price.
+    pub fn with_tick_height(self, tick: Option<f64>, height: f32, max_points: f64) -> Self {
+        let Some(tick) = tick.filter(|tick| tick.is_finite() && *tick > 0.0) else {
+            return self;
+        };
+        if !height.is_finite() || height <= 0.0 || max_points <= 0.0 {
+            return self;
+        }
+        let half = ((self.high - self.low).max(f64::from(height) * tick / max_points)) * 0.5;
+        let center = (self.low + self.high) * 0.5;
+        let low = (center - half).max(0.0);
+        Self {
+            low,
+            high: low + half * 2.0,
+        }
+    }
     pub fn from_bars(bars: &[UiBar]) -> Option<Self> {
         let mut low = f64::INFINITY;
         let mut high = f64::NEG_INFINITY;
@@ -603,7 +643,7 @@ mod tests {
             high: Decimal::from(high),
             low: Decimal::from(low),
             close: Decimal::from(high),
-            volume: Decimal::ONE,
+            volume: Some(Decimal::ONE),
         }
     }
 
@@ -807,7 +847,7 @@ mod tests {
     }
 
     #[test]
-    fn manual_price_scale_is_stable_until_auto_is_restored() {
+    fn manual_price_span_is_stable_and_visible_prices_stay_centered() {
         let mut viewport = ChartViewport::default();
         let original = PriceRange {
             low: 90.0,
@@ -823,8 +863,8 @@ mod tests {
         assert_eq!(
             viewport.resolve_price_scale(moved),
             PriceRange {
-                low: 80.0,
-                high: 120.0
+                low: 180.0,
+                high: 220.0
             }
         );
         viewport.reset_price_scale();
@@ -837,6 +877,24 @@ mod tests {
         let lines = range.grid_prices(1, 4);
         assert_eq!(lines, vec![99.5, 100.0, 100.5]);
         Ok(())
+    }
+
+    #[test]
+    fn real_tick_caps_automatic_height_without_distorting_prices() {
+        let range = PriceRange {
+            low: 99.95,
+            high: 100.05,
+        }
+        .with_tick_height(Some(0.05), 400.0, 4.0);
+        assert!(((range.low + range.high) * 0.5 - 100.0).abs() < 1e-9);
+        assert!((400.0 * 0.05 / (range.high - range.low) - 4.0).abs() < 1e-9);
+        let mut view = ChartViewport::default();
+        view.resolve_price_scale(range);
+        view.auto_price_scale = false;
+        view.price_zoom_milli = 500;
+        let zoomed = view.resolve_price_scale(range);
+        assert!(((zoomed.low + zoomed.high) * 0.5 - 100.0).abs() < 1e-9);
+        assert!(zoomed.high - zoomed.low < range.high - range.low);
     }
 
     #[test]

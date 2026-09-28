@@ -1,6 +1,10 @@
+pub(crate) mod account_clock;
+mod derived;
+mod fill_markers;
 mod position_actions;
 mod position_history;
 mod text;
+mod valuation;
 use crate::{
     client::ControlClient,
     model::AppModel,
@@ -16,6 +20,22 @@ use std::sync::Arc;
 use text::{Key, text};
 use venue_control_protocol::kol::{ExecutorCommandSummary, TerminalAccountProjection};
 
+fn position_side_label(
+    ui: &mut egui::Ui,
+    side: venue_domain::PositionSide,
+    language: crate::i18n::Language,
+) {
+    use crate::i18n::Language;
+    use venue_domain::PositionSide;
+    let chinese = language == Language::SimplifiedChinese;
+    let (label, color) = match side {
+        PositionSide::Long => (if chinese { "多" } else { "Long" }, theme::BUY),
+        PositionSide::Short => (if chinese { "空" } else { "Short" }, theme::SELL),
+        PositionSide::Net => (if chinese { "净仓" } else { "Net" }, theme::TEXT_SECONDARY),
+    };
+    ui.colored_label(color, label);
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 enum Tab {
     #[default]
@@ -30,6 +50,8 @@ enum Tab {
 
 #[derive(Debug, Default)]
 pub struct ExecutionViewState {
+    pub(crate) equity_estimate: std::cell::RefCell<crate::account_assets::EquityEstimate>,
+    pub(crate) account_clock: Option<account_clock::AccountClock>,
     pub private_error: Option<String>,
     pub terminal_executions_error: Option<String>,
     pub private_projection: Option<Arc<TerminalAccountProjection>>,
@@ -42,6 +64,9 @@ pub struct ExecutionViewState {
     pub inventory_mm: crate::inventory_mm_view::InventoryMmViewState,
     position_actions: position_actions::PositionActions,
     position_cycles: Vec<position_history::Cycle>,
+    fill_markers: fill_markers::FillMarkers,
+    open_orders_revision: u64,
+    valuations: std::cell::RefCell<valuation::FrameValuations>,
     pub(crate) chart_orders: crate::chart_trading::OrderTagState,
     private_received_ms: u64,
     tab: Tab,
@@ -50,7 +75,12 @@ pub struct ExecutionViewState {
 
 impl ExecutionViewState {
     pub(crate) fn clear_account_view(&mut self) {
+        self.equity_estimate = Default::default();
+        self.account_clock = None;
+        self.valuations = Default::default();
+        self.open_orders_revision = self.open_orders_revision.wrapping_add(1);
         self.position_cycles.clear();
+        self.fill_markers = Default::default();
         self.private_projection = None;
         self.private_received_ms = 0;
         self.private_error = None;
@@ -81,6 +111,15 @@ impl ExecutionViewState {
         projection: Option<TerminalAccountProjection>,
         trade_dock: &mut TradeDockState,
     ) {
+        self.apply_private_shared(projection.map(Arc::new), trade_dock);
+    }
+
+    pub(crate) fn apply_private_shared(
+        &mut self,
+        projection: Option<Arc<TerminalAccountProjection>>,
+        trade_dock: &mut TradeDockState,
+    ) {
+        self.valuations = Default::default();
         if let Some(mut projection) = projection {
             if projection.validate().is_err()
                 || self.private_projection.as_ref().is_some_and(|old| {
@@ -96,15 +135,20 @@ impl ExecutionViewState {
             }
             // The history table and chart markers share the same bounded recent facts,
             // including when an older server returns a larger snapshot.
-            projection
+            if !projection
                 .fills
-                .sort_by_key(|fill| std::cmp::Reverse(fill.occurred_ms));
-            projection
-                .fills
-                .truncate(venue_control_protocol::kol::TERMINAL_DISPLAY_HISTORY_LIMIT);
-            projection
-                .position_history
-                .truncate(venue_control_protocol::kol::TERMINAL_DISPLAY_HISTORY_LIMIT);
+                .is_sorted_by_key(|fill| std::cmp::Reverse(fill.occurred_ms))
+            {
+                Arc::make_mut(&mut projection)
+                    .fills
+                    .sort_by_key(|fill| std::cmp::Reverse(fill.occurred_ms));
+            }
+            let limit = venue_control_protocol::kol::TERMINAL_DISPLAY_HISTORY_LIMIT;
+            if projection.fills.len() > limit || projection.position_history.len() > limit {
+                let bounded = Arc::make_mut(&mut projection);
+                bounded.fills.truncate(limit);
+                bounded.position_history.truncate(limit);
+            }
             if trade_dock
                 .terminal_order_selection
                 .as_ref()
@@ -113,13 +157,25 @@ impl ExecutionViewState {
                 trade_dock.clear_order_selection();
             }
             self.chart_orders.observe(&projection);
-            self.position_cycles = position_history::rebuild(&projection);
+            let changes =
+                derived::Changes::between(self.private_projection.as_deref(), &projection);
+            if changes.orders {
+                self.open_orders_revision = self.open_orders_revision.wrapping_add(1);
+            }
+            if changes.fills {
+                self.fill_markers = fill_markers::FillMarkers::rebuild(&projection.fills);
+            }
+            if changes.cycles {
+                self.position_cycles = position_history::rebuild(&projection);
+            }
             self.private_received_ms = crate::account_center::now_ms();
-            self.private_projection = Some(Arc::new(projection));
+            self.private_projection = Some(projection);
             self.private_error = None;
         } else {
+            self.open_orders_revision = self.open_orders_revision.wrapping_add(1);
             trade_dock.clear_order_selection();
             self.position_cycles.clear();
+            self.fill_markers = Default::default();
             self.private_projection = None;
             self.private_received_ms = 0;
             self.private_error = None;
@@ -145,6 +201,29 @@ impl ExecutionViewState {
             self.terminal_executions = executions;
             self.terminal_executions_error = None;
         }
+    }
+
+    pub(crate) fn fill_execution(
+        &self,
+        symbol: &str,
+        order_id: &str,
+    ) -> Option<(rust_decimal::Decimal, rust_decimal::Decimal)> {
+        self.fill_markers.execution(symbol, order_id)
+    }
+
+    pub(crate) fn fill_markers(
+        &self,
+        symbol: &str,
+    ) -> &[venue_control_protocol::kol::TerminalFill] {
+        self.fill_markers.for_symbol(symbol)
+    }
+
+    pub(crate) fn open_orders_revision(&self) -> u64 {
+        self.open_orders_revision
+    }
+
+    pub(crate) fn begin_frame(&self, frame: u64) {
+        self.valuations.borrow_mut().begin(frame);
     }
 
     pub fn apply_terminal_execution(&mut self, summary: ExecutorCommandSummary) {
@@ -181,7 +260,16 @@ impl ExecutionViewState {
             && fresh_time(self.private_received_ms, now)
             && self
                 .private_projection_for(trading_account_id)
-                .is_some_and(|projection| fresh_time(projection.observed_ms, now))
+                .is_some_and(|projection| {
+                    fresh_time(projection.observed_ms, self.account_now_ms(now))
+                })
+    }
+
+    pub(crate) fn account_now_ms(&self, local_now: u64) -> u64 {
+        self.account_clock
+            .as_ref()
+            .and_then(|clock| clock.now_ms(local_now))
+            .unwrap_or(local_now)
     }
 
     pub(crate) fn private_received_ms(&self) -> u64 {
@@ -191,7 +279,7 @@ impl ExecutionViewState {
     fn refresh_warning(&self, observed_ms: u64, now: u64) -> Key {
         if self.private_error.is_some() {
             Key::ConnectionRetry
-        } else if observed_ms > now.saturating_add(2_000)
+        } else if observed_ms > self.account_now_ms(now).saturating_add(2_000)
             || self.private_received_ms > now.saturating_add(2_000)
         {
             Key::ClockMismatch
@@ -247,7 +335,13 @@ pub fn show(ui: &mut egui::Ui, model: &mut AppModel, client: &ControlClient) {
             (Tab::Assets, Key::Assets),
         ] {
             let label = tab_label(model, tab, key, language);
-            ui.selectable_value(&mut model.execution.tab, tab, label);
+            let response = ui.selectable_value(&mut model.execution.tab, tab, label);
+            if tab == Tab::PositionHistory {
+                response.on_hover_text(match language {
+                    crate::i18n::Language::SimplifiedChinese => "根据最近成交与零仓快照估算，历史可能不完整；完整流水请看历史成交。",
+                    crate::i18n::Language::English => "Estimated from recent fills and flat snapshots; history may be incomplete. See trade history for recorded fills.",
+                });
+            }
         }
         ui.separator();
         ui.checkbox(
@@ -369,6 +463,7 @@ fn show_private_projection(
     let mut requested_symbol = None;
     let mut requested_order = None;
     let mut requested_position = None;
+    let column_width = table_min_column_width(model.execution.tab, ui.available_width());
     history_table_scroll(
         ui,
         model.execution.tab,
@@ -382,7 +477,7 @@ fn show_private_projection(
                 .striped(true)
                 .start_row(visible.start)
                 .min_row_height(row_height)
-                .min_col_width(72.0)
+                .min_col_width(column_width)
                 .spacing([18.0, 8.0])
                 .show(ui, |ui| {
                     let headings: &[Key] = match model.execution.tab {
@@ -446,7 +541,7 @@ fn show_private_projection(
                                 {
                                     requested_symbol = Some(row.symbol.to_string());
                                 }
-                                ui.label(format!("{:?}", row.position_side));
+                                position_side_label(ui, row.position_side, language);
                                 market_quantity(ui, model, &row.symbol, Some(row.quantity));
                                 market_price(ui, model, &row.symbol, row.entry_price);
                                 market_price(ui, model, &row.symbol, row.mark_price);
@@ -575,9 +670,7 @@ fn show_private_projection(
                                     }
                                 });
                                 ui.monospace(
-                                    row.native_order_id
-                                        .as_deref()
-                                        .map_or(row.command_id.as_str(), |value| value),
+                                    row.native_order_id.as_deref().unwrap_or(&row.command_id),
                                 );
                                 ui.weak(timestamp(row.updated_ms));
                                 ui.end_row();
@@ -636,7 +729,9 @@ fn history_table_scroll(
     virtualized: bool,
     contents: impl FnOnce(&mut egui::Ui, std::ops::Range<usize>),
 ) {
-    let scroll = egui::ScrollArea::both().id_salt(("private-execution-table-scroll", tab as u8));
+    let scroll = egui::ScrollArea::both()
+        .id_salt(("private-execution-table-scroll", tab as u8))
+        .auto_shrink([false, false]);
     if virtualized {
         ui.scope(|ui| {
             ui.spacing_mut().item_spacing.y = 8.0;
@@ -649,6 +744,18 @@ fn history_table_scroll(
     }
 }
 
+fn table_min_column_width(tab: Tab, available_width: f32) -> f32 {
+    let columns: f32 = match tab {
+        Tab::Positions | Tab::OrderHistory => 8.0,
+        Tab::CurrentOrders => 9.0,
+        Tab::Fills => 7.0,
+        Tab::Assets => 3.0,
+        Tab::PositionHistory => 11.0,
+        Tab::Bots => 1.0,
+    };
+    ((available_width - (columns - 1.0) * 18.0) / columns).max(72.0)
+}
+
 fn position_pnl(
     ui: &mut egui::Ui,
     model: &AppModel,
@@ -658,8 +765,8 @@ fn position_pnl(
     if let Some(pnl) = pnl {
         ui.colored_label(pnl_color(pnl), format!("{:.4}", pnl.round_dp(4)))
             .on_hover_text(
-                "本地计算：价差 × 持仓数量（按多空方向）。采用最新成交价；行情过期回退签名标记价。不含手续费与资金费。
-Locally calculated from price movement and position quantity. Uses fresh last price, or signed mark when stale. Excludes fees and funding.",
+                "本地计算：价差 × 持仓数量（按多空方向）。多仓用买一、空仓用卖一；盘口过期回退最新成交价或签名标记价。不含手续费与资金费。
+Locally calculated from price movement and position quantity. Long at bid, short at ask; falls back to fresh last or signed mark. Excludes fees and funding.",
             );
     } else {
         ui.label("—");
@@ -684,7 +791,8 @@ fn position_usd_value_value(
     position.mark_price?.checked_mul(position.quantity)
 }
 
-pub(crate) fn position_pnl_value(
+#[cfg(test)]
+fn position_pnl_value(
     position: &venue_control_protocol::kol::TerminalPosition,
 ) -> Option<rust_decimal::Decimal> {
     position_pnl_at(position, position.mark_price)
@@ -704,34 +812,12 @@ pub(crate) fn live_position_pnl_value(
     model: &AppModel,
     position: &venue_control_protocol::kol::TerminalPosition,
 ) -> Option<rust_decimal::Decimal> {
-    let now = crate::account_center::now_ms();
-    // Only prices from the execution venue may value that account's position.
-    if model
-        .selected_execution_credential()
-        .is_some_and(|credential| credential.venue != model.preferences.market_server.venue())
-    {
-        return position_pnl_value(position);
-    }
-    let symbol = position.symbol.to_string();
-    let ticker = model
-        .local_quotes
-        .get(&symbol)
-        .map(|quote| (quote.last, quote.exchange_time_ms, quote.received_ms));
-    #[cfg(not(target_arch = "wasm32"))]
-    let latest_trade = model.local_markets.latest_price_for_symbol(&symbol);
-    #[cfg(target_arch = "wasm32")]
-    let latest_trade = None;
-    let price = ticker
-        .into_iter()
-        .chain(latest_trade)
-        .filter(|(price, event_ms, received_ms)| {
-            fresh_time(*received_ms, now)
-                && fresh_time(*event_ms, now)
-                && *price > rust_decimal::Decimal::ZERO
-        })
-        .max_by_key(|(_, event_ms, received_ms)| (*event_ms, *received_ms))
-        .map(|(price, _, _)| price);
-    position_pnl_at(position, price.or(position.mark_price))
+    model.execution.valuations.borrow_mut().value(position, || {
+        position_pnl_at(
+            position,
+            model.position_market_price(position, crate::market_prices::now_ms()),
+        )
+    })
 }
 
 fn position_pnl_at(
@@ -795,7 +881,7 @@ fn market_quantity(
 }
 
 fn decimal(ui: &mut egui::Ui, value: Option<rust_decimal::Decimal>) {
-    ui.label(value.map_or_else(|| "—".into(), |v| v.normalize().to_string()));
+    ui.label(value.map_or_else(|| "—".into(), |v| format!("{v:.2}")));
 }
 
 fn tab_label(model: &AppModel, tab: Tab, key: Key, language: crate::i18n::Language) -> String {
@@ -910,10 +996,18 @@ mod tests {
             output.textures_delta.clear();
         }
     }
+
+    #[test]
+    fn account_table_columns_expand_to_fill_the_pane_and_keep_a_narrow_minimum() {
+        assert!(table_min_column_width(Tab::Positions, 1580.0) > 170.0);
+        assert_eq!(table_min_column_width(Tab::Positions, 400.0), 72.0);
+        assert!(table_min_column_width(Tab::CurrentOrders, 1580.0) > 150.0);
+    }
     use super::*;
 
-    fn private_projection(account: &str, observed_ms: u64) -> TerminalAccountProjection {
+    pub(super) fn private_projection(account: &str, observed_ms: u64) -> TerminalAccountProjection {
         TerminalAccountProjection {
+            balance_observed_ms: None,
             schema_version: venue_control_protocol::kol::TERMINAL_PROJECTION_SCHEMA_VERSION,
             credential_id: "00000000-0000-4000-8000-000000000002".into(),
             trading_account_id: account.into(),
@@ -928,6 +1022,43 @@ mod tests {
             fills: vec![],
             assets: vec![],
         }
+    }
+
+    #[test]
+    fn shared_projection_publication_reuses_all_fields_and_clears_markers()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut state = ExecutionViewState::default();
+        let mut dock = TradeDockState::default();
+        let mut facts = private_projection("00000000-0000-4000-8000-000000000003", 10_000);
+        facts.fills.push(venue_control_protocol::kol::TerminalFill {
+            symbol: "BTC/USDC".parse()?,
+            native_order_id: "order".into(),
+            native_trade_id: "trade".into(),
+            order_side: venue_domain::OrderSide::Buy,
+            position_side: venue_domain::PositionSide::Long,
+            quantity: 1.into(),
+            price: 10.into(),
+            maker: None,
+            occurred_ms: Some(9_999),
+        });
+        let shared = Arc::new(facts);
+        state.apply_private_shared(Some(shared.clone()), &mut dock);
+        assert!(Arc::ptr_eq(
+            state.private_projection.as_ref().ok_or("missing")?,
+            &shared
+        ));
+        let markers = state.fill_markers("BTC/USDC").as_ptr();
+        let revision = state.open_orders_revision();
+        let mut heartbeat = (*shared).clone();
+        heartbeat.observed_ms += 1;
+        heartbeat.persisted_ms += 1;
+        state.apply_private(Some(heartbeat), &mut dock);
+        assert_eq!(markers, state.fill_markers("BTC/USDC").as_ptr());
+        assert_eq!(revision, state.open_orders_revision());
+        state.clear_account_view();
+        assert!(state.fill_markers("BTC/USDC").is_empty());
+        assert_ne!(revision, state.open_orders_revision());
+        Ok(())
     }
 
     fn open_order(symbol: venue_domain::Symbol) -> venue_control_protocol::kol::TerminalOpenOrder {
@@ -1108,6 +1239,31 @@ mod tests {
         assert!(!state.private_ready(None, 20_000));
         state.private_received_ms = 1;
         assert!(!state.private_ready(Some("account-a"), 20_000));
+    }
+
+    #[test]
+    fn calibrated_account_clock_preserves_stale_and_future_fact_checks() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            reqwest::header::DATE,
+            reqwest::header::HeaderValue::from_static("Fri, 11 Sep 2026 01:00:00 GMT"),
+        );
+        let mut state = ExecutionViewState {
+            account_clock: account_clock::AccountClock::from_response(&headers, 100),
+            private_projection: Some(Arc::new(private_projection("account-a", 1_789_088_400_000))),
+            private_received_ms: 19_500,
+            ..Default::default()
+        };
+        assert!(state.private_ready(Some("account-a"), 20_000));
+        assert!(!state.private_ready(Some("account-b"), 20_000));
+        state.private_projection =
+            Some(Arc::new(private_projection("account-a", 1_789_088_380_000)));
+        assert!(!state.private_ready(Some("account-a"), 20_000));
+        state.private_projection =
+            Some(Arc::new(private_projection("account-a", 1_789_088_420_000)));
+        assert!(!state.private_ready(Some("account-a"), 20_000));
+        state.clear_account_view();
+        assert!(state.account_clock.is_none());
     }
     #[test]
     fn refreshed_projection_clears_a_selected_order_only_after_it_disappears()

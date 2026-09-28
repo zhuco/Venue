@@ -1,5 +1,7 @@
 # VENUE
 
+<img src="apps/ui/desktop/assets/venue.png" alt="VENUE" width="112" height="112">
+
 当前产品版本：**v0.1.2**（[VERSION](VERSION) / [更新说明](docs/CHANGELOG.md)）。
 
 VENUE 提供 Binance 交易终端、KOL 人工带单和对冲网格。VenueFlow 是原生桌面客户端，Web 提供邀请注册、账户管理和跟单设置；交易统一由服务端单个多账户 `venue-executor-binance` 执行。Binance KOL、终端和 Binance Grid 使用 Portfolio Margin UM 双向持仓账户；另外五所通过独立策略入口执行，支撑分批做多首个闭环使用 Bybit LIVE。
@@ -47,9 +49,9 @@ Control 负责认证、配置和命令入账；Executor 负责物理交易。Pos
 ./scripts/Invoke-VenueBuild.ps1 -CheckOnly
 ./scripts/Invoke-VenueBuild.ps1 -CargoArguments @('check','--locked','-p','venue-control')
 
-# 构建桌面客户端，完成后从 guard 输出的固定目录启动二进制。
-./scripts/Invoke-VenueBuild.ps1 -CargoArguments @('build','--locked','--release','-p','venueflow','--bin','venueflow')
-./scripts/Start-VenueFlow.ps1
+# 编译并启动桌面客户端。-BuildOnly 只保留受控编译，不启动进程。
+./scripts/Build-Run-VenueFlow.ps1
+./scripts/Build-Run-VenueFlow.ps1 -BuildOnly
 ```
 
 Web 在 `apps/ui/web` 执行 `npm ci`、`npm run typecheck`、`npm test`、`npm run build` 和 `npm run verify:boundary`。运行配置与浏览器验证见 [Web 指南](docs/WEB.md)；Control/Executor 的数据库、主密钥和角色配置见 [账户管理](docs/ACCOUNT_MANAGEMENT.md) 与 [发布及回滚](docs/DEVELOPMENT.md#executor-release)。Ubuntu 构建使用本机 `scripts/Build-VenueUbuntu.ps1 -Component Control`。

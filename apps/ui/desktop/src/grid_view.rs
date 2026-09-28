@@ -1297,6 +1297,7 @@ mod tests {
                 mark_price: Some(mark),
             };
         let projection = venue_control_protocol::kol::TerminalAccountProjection {
+            balance_observed_ms: None,
             schema_version: venue_control_protocol::kol::TERMINAL_PROJECTION_SCHEMA_VERSION,
             credential_id: "00000000-0000-4000-8000-000000000010".to_owned(),
             trading_account_id: "00000000-0000-4000-8000-000000000101".to_owned(),

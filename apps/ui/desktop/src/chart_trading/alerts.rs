@@ -73,28 +73,45 @@ impl AlertBook {
 }
 
 pub(crate) fn poll(model: &mut AppModel) {
-    // Saved alerts predate venue binding and belong to the original Binance source.
+    // Saved alerts belong to the original Binance source; switching source clears crossing baselines.
     if model.preferences.market_server != crate::model::MarketServer::Binance {
+        for alert in &mut model.preferences.chart_alerts.items {
+            alert.previous = None;
+        }
         return;
     }
-    let now = crate::account_center::now_ms();
-    for quote in model.local_quotes.values() {
-        if quote.exchange_time_ms > now.saturating_add(2_000)
-            || now.saturating_sub(quote.exchange_time_ms) > 15_000
-            || now.saturating_sub(quote.received_ms) > 15_000
-        {
+    let now = crate::market_prices::now_ms();
+    let symbols = model
+        .preferences
+        .chart_alerts
+        .items
+        .iter()
+        .filter(|alert| alert.active)
+        .map(|alert| alert.symbol.clone())
+        .collect::<std::collections::BTreeSet<_>>();
+    for symbol in symbols {
+        let Some(price) = model.market_prices(&symbol, now).last else {
+            for alert in model
+                .preferences
+                .chart_alerts
+                .items
+                .iter_mut()
+                .filter(|alert| alert.symbol == symbol)
+            {
+                alert.previous = None;
+            }
             continue;
-        }
-        let triggered = model.preferences.chart_alerts.observe(
-            &quote.symbol,
-            quote.exchange_time_ms,
-            quote.last,
-        );
+        };
+        let triggered =
+            model
+                .preferences
+                .chart_alerts
+                .observe(&symbol, price.event_ms, price.value);
         for price in triggered {
             model.preferences.chart_alerts.notification = Some(format!(
                 "{} {} · {} {}",
                 label(model.preferences.language, "价格提醒", "Price alert"),
-                quote.symbol,
+                symbol,
                 label(model.preferences.language, "已触及", "Reached"),
                 price.normalize()
             ));

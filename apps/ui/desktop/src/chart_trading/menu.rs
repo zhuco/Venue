@@ -121,8 +121,8 @@ pub(super) fn contents(ui: &mut egui::Ui, settings: &mut ChartTradingSettings, l
     )
     .on_hover_text(label(
         language,
-        "按真实成交时间显示标记；悬停查看价格和数量",
-        "Actual fill markers; hover for price and quantity",
+        "按真实成交时间显示标记；悬停查看成交名义价值和成交价格",
+        "Actual fill markers; hover for executed notional and execution price",
     ));
     row(
         ui,

@@ -142,6 +142,28 @@ impl AccountService {
         let (subject, credential_id) = self
             .managed_verification_subject(principal, &request.managed_id, now_ms)
             .await?;
+        if let Some(authorization) = request.authorization {
+            if !authorization.valid() {
+                return Err(error(Code::InvalidInput));
+            }
+            let mut tx = self.pool.begin().await.map_err(database_error)?;
+            let allowed: bool=sqlx::query_scalar("SELECT verification_json->>'verification'<>'verified' AND NOT EXISTS(SELECT 1 FROM venue_kol_follow_relations WHERE follower_user_id=$2) FROM venue_api_credentials WHERE credential_id=$1 AND user_id=$2 AND deleted_ms IS NULL FOR UPDATE")
+                .bind(&credential_id).bind(&subject.user.user_id).fetch_one(&mut *tx).await.map_err(database_error)?;
+            if !allowed {
+                return Err(error(Code::Conflict));
+            }
+            super::credentials::save_follow_authorization(&mut tx, &credential_id, authorization)
+                .await?;
+            // Supersede an in-flight first verification before it can install old settings.
+            sqlx::query(
+                "UPDATE venue_api_credentials SET revision=revision+1 WHERE credential_id=$1",
+            )
+            .bind(&credential_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(database_error)?;
+            tx.commit().await.map_err(database_error)?;
+        }
         let summary = self
             .verify_with(&subject, &credential_id, now_ms, probe)
             .await?;
@@ -368,16 +390,13 @@ impl AccountService {
         if !has_follow_owner {
             return Ok(());
         }
-        if summary.has_exposure != Some(false) {
-            return Err(error(Code::AccountInUse));
-        }
         let equity = summary.equity.ok_or(error(Code::Unavailable))?;
         if equity <= Decimal::ZERO {
             return Err(error(Code::AccountInUse));
         }
         // Keep legacy wire fields valid; new mirrors persist ExchangeAccount admission.
         let order = match authorization.sizing {
-            FollowSizing::Proportional => equity,
+            FollowSizing::Proportional | FollowSizing::SourceRatio { .. } => equity,
             FollowSizing::FixedNotional { notional } => notional,
         };
         let total = order;

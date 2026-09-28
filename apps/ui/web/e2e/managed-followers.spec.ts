@@ -3,7 +3,7 @@ import { mkdirSync } from "node:fs";
 import { join } from "node:path";
 
 test("managed account dialog saves, retries with the same identity, verifies and clears secrets", async ({page}, info) => {
-  const accounts: object[] = []; const saves: Record<string,string>[] = []; let lost = true; let probes = 0;
+  const accounts: object[] = []; const saves: Record<string,string>[] = []; let lost = true; let probes = 0; let verifiedAuthorization: unknown;
   await page.route("**/api/customer/**", async route => {
     const action = new URL(route.request().url()).pathname.split("/").at(-1);
     let value: unknown = null;
@@ -21,7 +21,7 @@ test("managed account dialog saves, retries with the same identity, verifies and
         if(lost) { lost=false; await route.fulfill({status:503,json:{code:"unavailable"}}); return; }
         value={managed_id:body.request_id,label:body.label,masked_key:"••••1234",verification:"unverified",verified_ms:null,equity:null,available_margin:null,balance_observed_ms:null}; accounts.push(value as object);
       }
-    } else if(action === "managed-verify") { probes++; value={...accounts[0],verification:"verified",verified_ms:Date.now(),equity:"10",available_margin:"8",balance_observed_ms:Date.now()}; accounts[0]=value as object; }
+    } else if(action === "managed-verify") { probes++; verifiedAuthorization=route.request().postDataJSON().authorization; value={...accounts[0],verification:"verified",verified_ms:Date.now(),equity:"10",available_margin:"8",balance_observed_ms:Date.now()}; accounts[0]=value as object; }
     else if(action === "managed-delete") { accounts.splice(0,1); value={can_manage:true,accounts}; }
     else throw new Error(`Unexpected route ${action}`);
     await route.fulfill({json:value});
@@ -47,7 +47,15 @@ test("managed account dialog saves, retries with the same identity, verifies and
   const panel=page.getByRole("region",{name:"托管跟单账户"});
   await expect(panel.getByRole("cell",{name:"托管一号",exact:true})).toBeVisible();
   const verify = panel.getByRole("button",{name:"验证权限并申请跟单",exact:true}); await verify.focus(); await verify.press("Enter");
-  await expect(panel.getByRole("cell",{name:"验证通过",exact:true})).toBeVisible(); expect(probes).toBe(1);
+  const verifyDialog=page.getByRole("dialog",{name:"托管一号 · 验证权限并申请跟单"});
+  await expect(verifyDialog).toBeVisible(); expect(probes).toBe(0);
+  await verifyDialog.getByRole("button",{name:"修改首次跟单设置",exact:true}).click();
+  await expect(verifyDialog.getByLabel("主单比例（%）")).toHaveValue("50");
+  await page.screenshot({path:join(screenshots,`source-ratio-${info.project.name}.png`)});
+  expect(await verifyDialog.evaluate(element => element.scrollWidth <= element.clientWidth)).toBeTruthy();
+  await verifyDialog.getByRole("button",{name:"确认设置并验证",exact:true}).click();
+  await expect(panel.getByRole("cell",{name:"验证通过",exact:true})).toBeVisible();
+  expect(verifiedAuthorization).toEqual({sizing:{mode:"source_ratio",ratio:"0.5"},multiplier:"1"}); expect(probes).toBe(1);
   await expect(panel.getByRole("cell",{name:"10 USD",exact:true})).toBeVisible();
   await expect(panel.getByRole("cell",{name:"8 USD",exact:true})).toBeVisible();
   await expect(panel.getByRole("button",{name:"跟单设置",exact:true})).toBeVisible();

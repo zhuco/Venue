@@ -17,7 +17,7 @@ use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
     time::{SystemTime, UNIX_EPOCH},
 };
-use tokio::runtime::{Builder, Runtime};
+use tokio::runtime::Runtime;
 use venue_domain::domain::{
     ExecutionCommand, FieldState, Fill, LimitTimeInForce, NativeOrderFamily, Order, OrderCommand,
     OrderSide, OrderState, PositionSide, Price, Symbol,
@@ -52,7 +52,7 @@ const MAX_PENDING_PRIVATE_FILLS: usize = 256;
 /// Production Gate adapter for the account host. The only mutation call consumes the host's
 /// linear permit; all account-wide risk reads remain signed GET requests inside this crate.
 pub struct GateAccountGateway {
-    runtime: Runtime,
+    runtime: &'static Runtime,
     binding: GateGatewayBinding,
     credentials: GateCredentials,
     transport: GateHttpTransport,
@@ -102,10 +102,7 @@ impl GateAccountGateway {
             .map_err(GateAccountGatewayError::Transport)?;
         let binding =
             GateGatewayBinding::new(binding).map_err(|_| GateAccountGatewayError::Binding)?;
-        let runtime = Builder::new_current_thread()
-            .enable_io()
-            .enable_time()
-            .build()
+        let runtime = venue_gateway_api::transport_pool::account_runtime()
             .map_err(|_| GateAccountGatewayError::Runtime)?;
         let generation = now_ms()?;
         let transport = GateHttpTransport::new(&binding, generation, limits)

@@ -93,7 +93,7 @@ mod tests {
             high: Decimal::from(high),
             low: Decimal::from(low),
             close: Decimal::from(high),
-            volume: Decimal::ONE,
+            volume: Some(Decimal::ONE),
         };
         let bars = [bar(100, 1), bar(20, 10), bar(30, 5), bar(30, 5)];
         assert_eq!(extrema(&bars), Some((0, 0)));

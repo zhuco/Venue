@@ -1,5 +1,96 @@
 use super::*;
 
+#[test]
+fn funding_readout_separates_current_prediction_and_expired_settlement()
+-> Result<(), Box<dyn std::error::Error>> {
+    use rust_decimal::Decimal;
+    use venue_domain::{FieldState, MarkFunding, MarketTimeSource};
+    let funding = MarkFunding {
+        symbol: "DOGE/USDC".parse()?, generation: 1,
+        received_at_ms: 1_000_000, exchange_time_ms: 999_000,
+        time_source: MarketTimeSource::Exchange,
+        next_funding_time_ms: Some(1_060_001),
+        mark_price: FieldState::Missing, index_price: FieldState::Missing,
+        funding_rate: Decimal::new(-25, 4),
+        estimated_settle_price: FieldState::Missing,
+        predicted_funding_rate: FieldState::Known(Decimal::new(1, 3)),
+        unknown_reason: None,
+    };
+    let (label, tooltip) = presentation::funding_display(&funding, 1_000_000, Language::English);
+    assert!(label.contains("-0.2500% · 0h 2m"));
+    assert!(tooltip.contains("Predicted rate: 0.1000%"));
+    assert!(tooltip.contains("Settlement interval: unavailable"));
+    let (expired, _) = presentation::funding_display(&funding, 1_070_000, Language::English);
+    assert!(expired.contains("awaiting update · stale"));
+    assert!(!expired.contains("0h 0m"));
+    Ok(())
+}
+
+#[test]
+fn oi_current_readout_keeps_unknown_unit_visible_and_marks_clock_skew()
+-> Result<(), Box<dyn std::error::Error>> {
+    use rust_decimal::Decimal;
+    use venue_domain::{FieldState, MarketTimeSource, OpenInterestSample, OpenInterestUnit,
+        UnknownReason};
+    let mut interest = OpenInterestSample {
+        symbol: "DOGE/USDC".parse()?, generation: 1,
+        received_at_ms: 1_001_000, exchange_time_ms: 1_001_000,
+        time_source: MarketTimeSource::Exchange, sampling_interval_ms: None,
+        native_quantity: Decimal::from(125),
+        native_unit: OpenInterestUnit::Contracts { base_per_contract: Decimal::ONE },
+        base_quantity: FieldState::Unavailable { reason: UnknownReason::Ambiguous },
+        quote_notional: FieldState::Missing, quote_asset: None,
+    };
+    let (label, tooltip) = presentation::open_interest_display(&interest, 1_000_000,
+        Language::SimplifiedChinese);
+    assert_eq!(label, "OI — · stale");
+    assert!(tooltip.contains("基础币数量不可用：合约单位不明确"));
+    assert!(presentation::open_interest_history_stale(Some(&interest), 1_000_000));
+    interest.base_quantity = FieldState::Known(Decimal::from(125));
+    interest.received_at_ms = 1_000_000;
+    interest.exchange_time_ms = 1_000_000;
+    let (label, _) = presentation::open_interest_display(&interest, 1_000_000,
+        Language::English);
+    assert_eq!(label, "OI 125 DOGE");
+    assert!(!presentation::open_interest_history_stale(Some(&interest), 1_900_000));
+    assert!(presentation::open_interest_history_stale(Some(&interest), 1_900_001));
+    Ok(())
+}
+
+#[test]
+fn three_avwap_anchors_and_fixed_profile_survive_restart_in_their_market_scope()
+-> Result<(), Box<dyn std::error::Error>> {
+    use crate::chart_view::analysis::{AvwapAnchor, FixedProfileRange};
+    let doge = crate::market::MarketSelection::binance_usd_m(
+        "DOGE/USDC", crate::chart::ChartInterval::OneMinute)?.binding;
+    let btc = crate::market::MarketSelection::binance_usd_m(
+        "BTC/USDC", crate::chart::ChartInterval::OneMinute)?.binding;
+    let mut preferences = crate::model::Preferences::default();
+    for id in 1..=3 {
+        preferences.analysis_anchors.push(AvwapAnchor {
+            id, pane_instance: 7, binding: doge.clone(), open_time_ms: id * 60_000,
+            reference_price: rust_decimal::Decimal::ONE, color: [240, 185, 11],
+        });
+    }
+    preferences.analysis_anchors.push(AvwapAnchor {
+        id: 4, pane_instance: 7, binding: btc.clone(), open_time_ms: 60_000,
+        reference_price: rust_decimal::Decimal::ONE, color: [90, 200, 250],
+    });
+    preferences.fixed_profile_ranges.push(FixedProfileRange {
+        pane_instance: 7, binding: doge.clone(), start_ms: 60_000, end_ms: 240_000,
+    });
+    let restored: crate::model::Preferences =
+        serde_json::from_slice(&serde_json::to_vec(&preferences)?)?;
+    assert_eq!(restored.analysis_anchors.iter()
+        .filter(|anchor| anchor.pane_instance == 7 && anchor.binding == doge)
+        .map(|anchor| (anchor.id, anchor.open_time_ms))
+        .collect::<Vec<_>>(), vec![(1, 60_000), (2, 120_000), (3, 180_000)]);
+    assert_eq!(restored.analysis_anchors.iter()
+        .filter(|anchor| anchor.binding == btc).count(), 1);
+    assert_eq!(restored.fixed_profile_ranges, preferences.fixed_profile_ranges);
+    Ok(())
+}
+
 fn collect_text(shape: &egui::Shape, output: &mut Vec<(String, egui::Rect)>) {
     match shape {
         egui::Shape::Text(value) => output.push((
@@ -40,6 +131,11 @@ fn trading_settings_header_and_done_remain_visible_in_small_windows() {
             }
             for label in [
                 text(language, TextKey::TradingSettings),
+                if language == Language::English {
+                    "Skip price change confirmation"
+                } else {
+                    "改价不再二次确认"
+                },
                 if language == Language::English {
                     "Done"
                 } else {
@@ -268,7 +364,7 @@ fn terminal_chrome_keeps_both_rows_at_the_top_of_the_window() -> Result<(), &'st
         symbol.top()
     );
     assert!(
-        (add_tab.center().y - trading.center().y).abs() <= 4.0,
+        trading.bottom() < add_tab.top(),
         "add_tab={add_tab:?}, trading={trading:?}"
     );
     assert!(
@@ -535,5 +631,152 @@ fn preset_schemes_fit_the_same_settings_window() {
             }
         }
         assert_eq!(window_bounds[0], window_bounds[1]);
+    }
+}
+
+#[test]
+fn market_search_is_centered_and_toolbar_actions_do_not_overlap() -> Result<(), &'static str> {
+    for language in Language::ALL {
+        for width in [850.0, 1100.0, 1900.0] {
+            let context = egui::Context::default();
+            theme::apply(&context);
+            let mut model = AppModel::new(crate::model::Preferences {
+                language,
+                ..Default::default()
+            });
+            let mut workspaces = Workspaces::default();
+            let (mut modules, mut trading, mut accounts, mut picker) = (false, false, false, false);
+            let mut labels = Vec::new();
+            for _ in 0..3 {
+                let mut frame = context.run_ui(
+                    egui::RawInput {
+                        screen_rect: Some(egui::Rect::from_min_size(
+                            egui::Pos2::ZERO,
+                            egui::vec2(width, 700.0),
+                        )),
+                        ..Default::default()
+                    },
+                    |ui| {
+                        show_top_bar(
+                            ui,
+                            &mut model,
+                            &mut workspaces,
+                            &mut modules,
+                            &mut trading,
+                            &mut accounts,
+                            &mut picker,
+                        )
+                    },
+                );
+                frame.textures_delta.clear();
+                labels.clear();
+                for shape in frame.shapes {
+                    collect_text(&shape.shape, &mut labels);
+                }
+            }
+            let hint = if language == Language::English {
+                "Search markets"
+            } else {
+                "搜索交易对"
+            };
+            let search = labels
+                .iter()
+                .find(|(s, _)| s == hint)
+                .map(|(_, r)| *r)
+                .ok_or("search missing")?;
+            // Hint is left aligned with a fixed inset inside the centered input.
+            let input_width = (width - 20.0 - 600.0).clamp(160.0, 320.0);
+            assert!(
+                (search.left() - (width - input_width) / 2.0 - 12.0).abs() < 6.0,
+                "search={search:?} width={width}"
+            );
+            let action = labels
+                .iter()
+                .find(|(s, _)| s == text(language, TextKey::TradingSettings))
+                .map(|(_, r)| *r)
+                .ok_or("trading missing")?;
+            assert!(
+                action.left() > width / 2.0 + input_width / 2.0,
+                "action={action:?} width={width}"
+            );
+            for caption in if language == Language::English {
+                ["MARKET DATA", "EXECUTION ACCOUNT"]
+            } else {
+                ["行情源", "执行账户"]
+            } {
+                let bounds = labels
+                    .iter()
+                    .find(|(s, _)| s == caption)
+                    .map(|(_, r)| *r)
+                    .ok_or("control caption missing")?;
+                assert!(
+                    bounds.height() < 20.0,
+                    "caption wrapped {caption}: {bounds:?}"
+                );
+            }
+            assert!(
+                labels.iter().all(|(_, r)| r.right() <= width + 1.0),
+                "toolbar clipped width={width}"
+            );
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn search_escape_and_enter_stay_closed_while_input_keeps_focus() {
+    for key in [egui::Key::Escape, egui::Key::Enter] {
+        let ctx = egui::Context::default();
+        theme::apply(&ctx);
+        let mut model = AppModel::new(Default::default());
+        let mut workspaces = Workspaces::default();
+        let (mut modules, mut trading, mut accounts, mut picker) = (false, false, false, false);
+        let point = egui::pos2(550.0, 22.0);
+        let mut run = |events| {
+            let mut out = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(1100.0, 700.0),
+                    )),
+                    events,
+                    ..Default::default()
+                },
+                |ui| {
+                    show_top_bar(
+                        ui,
+                        &mut model,
+                        &mut workspaces,
+                        &mut modules,
+                        &mut trading,
+                        &mut accounts,
+                        &mut picker,
+                    )
+                },
+            );
+            out.textures_delta.clear();
+            picker
+        };
+        run(vec![]);
+        for pressed in [true, false] {
+            run(vec![
+                egui::Event::PointerMoved(point),
+                egui::Event::PointerButton {
+                    pos: point,
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ]);
+        }
+        assert!(run(vec![egui::Event::Text("BTC".into())]));
+        assert!(!run(vec![egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE
+        }]));
+        assert!(!run(vec![]), "search reopened after {key:?}");
     }
 }

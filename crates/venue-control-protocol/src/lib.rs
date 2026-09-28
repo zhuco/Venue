@@ -626,7 +626,8 @@ pub struct UiBar {
     pub high: Decimal,
     pub low: Decimal,
     pub close: Decimal,
-    pub volume: Decimal,
+    /// None means the market source omitted base volume; price bars remain displayable.
+    pub volume: Option<Decimal>,
 }
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct UiBookLevel {
@@ -1012,7 +1013,7 @@ fn validate_bars(bars: &[UiBar], generated_ms: u64) -> Result<(), ProtocolError>
             || !positive(bar.high)
             || !positive(bar.low)
             || !positive(bar.close)
-            || bar.volume.is_sign_negative()
+            || bar.volume.is_some_and(|volume| volume.is_sign_negative())
             || bar.low > bar.open.min(bar.close)
             || bar.high < bar.open.max(bar.close)
             || bar.low > bar.high
@@ -1310,6 +1311,20 @@ pub enum ProtocolError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn ui_bar_preserves_missing_volume_and_existing_decimal_wire()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut snapshot = snapshot()?;
+        let existing = serde_json::to_value(&snapshot)?;
+        assert!(existing["markets"][0]["bars"][0]["volume"].is_string());
+        assert_eq!(serde_json::from_value::<ControlSnapshot>(existing)?.validate(), Ok(()));
+        snapshot.markets[0].bars[0].volume = None;
+        assert_eq!(snapshot.validate(), Ok(()));
+        let missing = serde_json::to_value(&snapshot)?;
+        assert!(missing["markets"][0]["bars"][0]["volume"].is_null());
+        assert_eq!(serde_json::from_value::<ControlSnapshot>(missing)?.validate(), Ok(()));
+        Ok(())
+    }
     fn request(action: ControlAction) -> Result<ControlCommandRequest, Box<dyn std::error::Error>> {
         Ok(ControlCommandRequest {
             schema_version: CONTROL_SCHEMA_VERSION,
@@ -1773,7 +1788,7 @@ mod tests {
                     high: Decimal::new(102, 0),
                     low: Decimal::new(97, 0),
                     close: Decimal::new(100, 0),
-                    volume: Decimal::new(200, 0),
+                    volume: Some(Decimal::new(200, 0)),
                 }],
                 bids: vec![UiBookLevel {
                     price: Decimal::new(99, 0),

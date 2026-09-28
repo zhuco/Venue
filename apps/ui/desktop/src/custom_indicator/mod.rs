@@ -1,9 +1,14 @@
+mod library;
+mod library_ui;
 mod render;
+mod script_render;
 mod text;
 mod ui;
 
+pub use library::{CustomLibrary, Entry, EntryKind};
+pub(crate) use library_ui::{LibraryEditor, settings_ui};
 pub(crate) use render::draw;
-pub(crate) use ui::settings_ui;
+pub(crate) use script_render::draw_scripts;
 
 use serde::{Deserialize, Serialize};
 use venue_indicators::chart::EmaAdxConfig;

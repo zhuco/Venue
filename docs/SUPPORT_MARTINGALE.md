@@ -1,6 +1,6 @@
-# 马丁做多：当前实现与增强契约
+# 马丁做多：策略与执行契约
 
-本文定义 `support_martingale` 的开发范围、策略规则、执行边界、VenueFlow 桌面交互和验收标准。产品名称为“马丁做多”，内部模块及既有 API 路径保留兼容名称。当前源码提供 Bybit 执行与 Bitget 原生带单账户接入；盈利能力仍须用持续实盘和样本外回测验证，部署与真实交易结果按每次验收记录判断。
+本文定义 `support_martingale` 的当前范围、策略规则、执行边界、VenueFlow 桌面交互和验收标准。产品名称为“马丁做多”，内部模块及既有 API 路径保留兼容名称。当前源码提供 Bybit 执行与 Bitget 原生带单账户接入；盈利能力仍须用持续实盘和样本外回测验证，部署与真实交易结果按每次验收记录判断。
 
 依赖现有[架构](ARCHITECTURE.md)、[多交易所执行](MULTI_VENUE_EXECUTOR.md)和[UI 入口](../apps/ui/README.md)。本策略是独立自营策略；Binance KOL 按人工带单契约同步普通限价、确认原生身份的市价及 `STOP_MARKET` 止损单，本策略的市价首仓/补仓不会因此自动获得 KOL 复制支持。
 
@@ -8,13 +8,13 @@
 
 Bitget 带单凭证通过专用绑定入口签名验证，马丁表单按当前已验证的 Bybit/Bitget 账户保存 `execution_venue`。Bitget 复用现有纯规划、持久预算、市价增仓及限价减仓止盈，发送增仓前额外核对专用 Key 的签名带单交易对范围；平台跟随复制由 Bitget 执行。币种选择须同时满足 Binance 参考行情可用、Bitget 正常永续规则及签名带单资格；最低名义额须计入数量步长取整，不以合约标注的最低金额单独判断。普通 UTA 网格与带单马丁按签名 UID 加交易范围分别占用账户，不能仅因 UID 相同合并两边资金与订单；同一带单范围内仍只准入一个活动策略。接入代码存在不代表该 Key 的准入、订单或平台复制已验收。
 
-已实现范围是：`venue-strategies` 的纯规则；Binance USD-M 15m/1h/4h 与 BTC 4h 公共 REST 连续性和新鲜度检查；Bybit 签名账户事实、市价累计成交回读、GTC 只减仓限价止盈；migration 0037 的实例、逐币、支撑身份、预算预留和命令关联；共享 Executor 单账户串行调度与发送前复核；Control 的创建/列表/详情/只读预检/生命周期接口；VenueFlow 的绑定账户保存、预检、风险确认、启动/暂停/等待止盈及失败展示。一个实例可同时配置多个规范交易对；具体币种和预算由实例配置决定，不将历史实盘参数写成产品默认值。
+实现入口统一见 [CODEMAP](CODEMAP.md#独立多交易所策略与支撑分批做多)。一个实例可配置多个规范交易对，币种和预算由配置决定，历史实盘参数不作为默认值。
 
 当前止盈使用保守的入场与退出费率上界，界面和状态必须视为估算；Bybit 已结算资金费的逐轮归集是精确净收益展示的增强项。未取得该事实时不把估算收益写成实际净收益，实盘候选使用较低总名义预算保留保证金缓冲。其他四个非 Binance 执行所虽然共享 Durable Gateway，仍须逐所完成本策略的市价、止盈、费用和恢复验收后才能启用；Binance 在本策略中先只作为无凭证参考行情源。
 
 本文后续的 capabilities、人工批量平仓、历史决策明细、资金费精确归集和逐所验收条目属于增强门，不应从文档描述推断已经上线。实例签名 preflight 已实现；可调用的 method/path 以第 9 节明确标注的接口及源码协议常量为准。
 
-## 1. 产品范围与评估结论
+## 1. 产品范围
 
 当前源码提供两种入场模式：默认 `support` 保留既有支撑信号；`fixed_price` 要求每个币设置 `entry_price` 和 `add_drop_rate`。第 n 层（首仓 n=0）阈值为 `entry_price × (1-add_drop_rate)^n`，执行所报价不高于阈值才规划市价买入，发送前再次检查价格、预算和止损底线。一次只执行一层，沿用轮次身份、层数、累计预算、冷却与不确定结果对账，不追补已消费层。
 
@@ -38,7 +38,7 @@ Bitget 带单凭证通过专用绑定入口签名验证，马丁表单按当前�
 
 “上涨条件失效不补”在本版明确指局部反弹确认失效；大周期下跌不再一律禁止已有仓位补仓。首仓过滤与补仓过滤分别执行，不能用开仓时的旧信号永久授予补仓资格。
 
-**评估：工程上可实现，但当前盈利优势未证实，风险较高。**有限补仓可以降低回本价，也会增加继续下跌的亏损。无止损、无限持仓与有限资金并存，可能长期占资或强平；暂停增险不能保证最大亏损。不能把高平仓胜率、减半预期或“当前低价回升”直接转换为安全系数或补仓豁免。
+当前盈利优势未证实。有限补仓可以降低回本价，也会增加继续下跌的亏损。无止损、无限持仓与有限资金并存，可能长期占资或强平；暂停增险不能保证最大亏损。不能把高平仓胜率、减半预期或“当前低价回升”直接转换为安全系数或补仓豁免。
 
 币安集中提供参考行情便于统一信号和回测，但“用户多”不足以证明每个合约都不受操控，也不能保证执行所价格跟随。低流动性标的、交易所价差、插针、下架、数据中断与稳定币偏离仍需独立处理。BTC 的长期判断也不能外推为所有候选币都会回本。
 
@@ -266,15 +266,15 @@ P_tp  = ceil_to_execution_tick(P_min)
 
 点击某币只改变查看上下文，不修改运行实例绑定。`client/stream_gates.rs` 的当前账户UI订阅可回收，但服务器策略订阅继续。现桌面手动 PostOnly 下单分支不用于市价首仓或补仓；现有终端确认习惯可复用，但本策略人工平仓还必须先封增险和处理旧止盈。
 
-已新增专用 `crates/venue-control-protocol/src/support_martingale.rs`、`apps/venue-control/src/accounts/support_martingale.rs` 及 HTTP 路由。以下标明当前接口与增强项：
+当前可调用接口与尚未提供的增强项如下；协议与源码定位见 CODEMAP：
 
 | 接口 | 用途 |
 |---|---|
 | `GET /v2/strategies/support-martingale/capabilities` | 增强项：本人凭证、交易所能力、报价与合约映射 |
-| `POST /v2/strategies/support-martingale/preflight` | 已实现：当前 revision 的只读账户检查；重验 LIVE 凭证/身份/权限、账户排他、签名事实新鲜度、持仓模式、空仓、开放订单、Unknown 和可用保证金；不入账交易，不授予永久发送资格 |
-| `GET/POST /v2/strategies/support-martingale/instances` | 已实现：本人实例列表、创建；创建为 Stopped |
-| `POST /v2/strategies/support-martingale/lifecycle` | 已实现：带 `request_id + expected_revision + action` 的幂等生命周期请求 |
-| `GET /v2/strategies/support-martingale/instances/{id}` | 已实现：实例、逐币状态、资金预留和归属投影 |
+| `POST /v2/strategies/support-martingale/preflight` | 当前 revision 的只读账户检查；重验 LIVE 凭证/身份/权限、账户排他、签名事实新鲜度、持仓模式、空仓、开放订单、Unknown 和可用保证金；不入账交易，不授予永久发送资格 |
+| `GET/POST /v2/strategies/support-martingale/instances` | 本人实例列表、创建；创建为 Stopped |
+| `POST /v2/strategies/support-martingale/lifecycle` | 带 `request_id + expected_revision + action` 的幂等生命周期请求 |
+| `GET /v2/strategies/support-martingale/instances/{id}` | 实例、逐币状态、资金预留和归属投影 |
 | `POST /v2/strategies/support-martingale/close` | 增强项：独立人工市价平仓与逐币结果 |
 
 列表与详情先复用现有约3秒的机器人轮询与请求后即时刷新；执行不依赖轮询，不为本功能另造事件总线。UI mutation 排队立即重绘，显示“请求已接收”等业务反馈不能变成“成交成功”。账户切换、旧 revision、重复点击和过期响应均须受客户端与服务端双重身份检查。
@@ -285,7 +285,7 @@ P_tp  = ceil_to_execution_tick(P_min)
 
 所有接口使用现有登录会话、用户归属和凭证密文边界，禁止客户端指定任意用户/真实账户或提交原生订单字段；原始密钥、签名、交易所错误响应不回显。接入 HTTPS 时只扩展 `scripts/configure_desktop_https.py` 的精确method/path，不开放任意代理或管理员CLI。
 
-## 10. 实施落点与交易所能力
+## 10. 交易所能力边界
 
 源码入口统一维护在 [CODEMAP](CODEMAP.md)，不在本页重复文件表。下面列出本策略各执行所的能力边界；Bybit 为当前首个闭环，其余行是扩展时必须核验的条件。
 

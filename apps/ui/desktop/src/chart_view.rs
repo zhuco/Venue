@@ -1,5 +1,6 @@
 use eframe::egui::{self, Align2, Color32, FontId, Pos2, Rect, Sense, Stroke};
 use venue_control_protocol::UiBar;
+use std::sync::Arc;
 
 use crate::{
     chart::{
@@ -13,10 +14,131 @@ use crate::{
 };
 
 type StudySelector = fn(&ChartStudyPoint) -> Option<rust_decimal::Decimal>;
+mod candles;
+pub(crate) mod analysis;
 pub(crate) mod loading;
+pub(crate) mod microstructure;
 mod price_annotations;
 mod price_axis;
+mod volume_profile;
+mod session_levels;
+mod support_resistance;
 mod study_readout;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum IndicatorCacheKind { Heatmap, Profile, Flow, Anchor }
+
+#[derive(Clone, Copy)]
+struct IndicatorCacheEntry {
+    kind: IndicatorCacheKind,
+    id: egui::Id,
+    seen_frame: u64,
+}
+
+const MAX_RETAINED_INDICATOR_CACHE_BYTES: usize = 56 * 1024 * 1024;
+
+fn indicator_cache_registry_id() -> egui::Id {
+    egui::Id::new("venueflow-indicator-cache-registry")
+}
+
+fn mark_indicator_cache(context: &egui::Context, kind: IndicatorCacheKind, id: egui::Id) {
+    let frame = context.cumulative_frame_nr();
+    context.data_mut(|data| {
+        let key = indicator_cache_registry_id();
+        let mut entries = data.get_temp::<Vec<IndicatorCacheEntry>>(key).unwrap_or_default();
+        if let Some(entry) = entries.iter_mut().find(|entry| entry.kind == kind && entry.id == id) {
+            entry.seen_frame = frame;
+        } else {
+            entries.push(IndicatorCacheEntry { kind, id, seen_frame: frame });
+        }
+        data.insert_temp(key, entries);
+    });
+}
+
+pub(crate) fn evict_inactive_indicator_caches(context: &egui::Context) {
+    let frame = context.cumulative_frame_nr();
+    let stale = context.data_mut(|data| {
+        let key = indicator_cache_registry_id();
+        let mut entries = data.get_temp::<Vec<IndicatorCacheEntry>>(key).unwrap_or_default();
+        let mut stale = Vec::new();
+        entries.retain(|entry| {
+            if entry.seen_frame == frame { true } else { stale.push(*entry); false }
+        });
+        if entries.is_empty() { data.remove::<Vec<IndicatorCacheEntry>>(key); }
+        else { data.insert_temp(key, entries); }
+        stale
+    });
+    for entry in stale { evict_indicator_cache(context, entry, true); }
+    evict_indicator_caches_to_budget(context, MAX_RETAINED_INDICATOR_CACHE_BYTES);
+}
+
+fn evict_indicator_cache(context: &egui::Context, entry: IndicatorCacheEntry,
+    cancel_pending: bool) {
+    match entry.kind {
+        IndicatorCacheKind::Heatmap if cancel_pending =>
+            microstructure::evict_heatmap(context, entry.id),
+        IndicatorCacheKind::Heatmap =>
+            microstructure::evict_heatmap_result(context, entry.id),
+        IndicatorCacheKind::Profile => volume_profile::evict(context, entry.id),
+        IndicatorCacheKind::Flow => context.data_mut(|data| {
+            data.remove::<Arc<MinuteFlowCache>>(entry.id.with("minute-flow-cache"));
+        }),
+        IndicatorCacheKind::Anchor => analysis::evict_anchor_cache(context, entry.id),
+    }
+}
+
+fn indicator_cache_entry_bytes(context: &egui::Context, entry: &IndicatorCacheEntry) -> usize {
+    match entry.kind {
+        IndicatorCacheKind::Heatmap =>
+            microstructure::heatmap_retained_bytes(context, entry.id),
+        IndicatorCacheKind::Profile => volume_profile::retained_bytes(context, entry.id),
+        IndicatorCacheKind::Anchor => analysis::retained_bytes(context, entry.id),
+        IndicatorCacheKind::Flow => context.data(|data|
+            data.get_temp::<Arc<MinuteFlowCache>>(entry.id.with("minute-flow-cache")))
+            .map_or(0, |cache| std::mem::size_of::<MinuteFlowCache>()
+                .saturating_add(cache.buckets.capacity()
+                    * std::mem::size_of::<(u64, bool)>())
+                .saturating_add(cache.values.capacity()
+                    * std::mem::size_of::<venue_indicators::chart::OrderFlowValue>())),
+    }
+}
+
+fn indicator_cache_total_bytes(context: &egui::Context, entries: &[IndicatorCacheEntry]) -> usize {
+    entries.iter().fold(entries.len() * std::mem::size_of::<IndicatorCacheEntry>(),
+        |total, entry| total.saturating_add(indicator_cache_entry_bytes(context, entry)))
+}
+
+fn evict_indicator_caches_to_budget(context: &egui::Context, budget: usize) {
+    let key = indicator_cache_registry_id();
+    let mut entries = context.data(|data|
+        data.get_temp::<Vec<IndicatorCacheEntry>>(key).unwrap_or_default());
+    while indicator_cache_total_bytes(context, &entries) > budget {
+        let Some(index) = entries.iter().enumerate()
+            .filter(|(_, entry)| indicator_cache_entry_bytes(context, entry) > 0)
+            .min_by_key(|(_, entry)| entry.seen_frame).map(|(index, _)| index) else { break; };
+        let entry = entries[index];
+        evict_indicator_cache(context, entry, false);
+        // A heatmap worker may finish after this frame; keep its registry entry so a
+        // subsequently closed chart can still cancel and release that late result.
+        if entry.kind != IndicatorCacheKind::Heatmap { entries.remove(index); }
+    }
+    context.data_mut(|data| {
+        if entries.is_empty() { data.remove::<Vec<IndicatorCacheEntry>>(key); }
+        else { data.insert_temp(key, entries); }
+    });
+}
+
+pub(crate) fn retained_indicator_cache_bytes(context: &egui::Context) -> usize {
+    let entries = context.data(|data|
+        data.get_temp::<Vec<IndicatorCacheEntry>>(indicator_cache_registry_id())
+            .unwrap_or_default());
+    indicator_cache_total_bytes(context, &entries)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn pending_indicator_input_bytes() -> usize {
+    microstructure::heatmap_pending_input_bytes()
+}
 
 #[derive(Clone, Copy)]
 enum PaneScale {
@@ -39,6 +161,15 @@ struct PaneSpec {
     reference_levels: &'static [f64],
 }
 
+struct MinuteFlowCache {
+    binding: venue_gateway_api::PublicMarketBinding,
+    revision: (u64, u64),
+    interval_ms: u64,
+    reset_mode: venue_indicators::chart::CvdResetMode,
+    buckets: Vec<(u64, bool)>,
+    values: Vec<venue_indicators::chart::OrderFlowValue>,
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn candle_plot(
     ui: &mut egui::Ui,
@@ -48,12 +179,25 @@ pub(crate) fn candle_plot(
     language: Language,
     settings: &ChartDisplaySettings,
     scales: (usize, usize),
+    price_tick: Option<rust_decimal::Decimal>,
     interval: crate::chart::ChartInterval,
     market_price: Option<rust_decimal::Decimal>,
     selected_price: Option<rust_decimal::Decimal>,
     trading_display: &crate::chart_trading::ChartTradingSettings,
     overlays: &[crate::chart_trading::ChartOverlay],
     bid_ask: (Option<rust_decimal::Decimal>, Option<rust_decimal::Decimal>),
+    depth: Option<(
+        &[venue_control_protocol::UiBookLevel],
+        &[venue_control_protocol::UiBookLevel],
+    )>,
+    market_scope: Option<&venue_gateway_api::PublicMarketBinding>,
+    minute_source: Option<(&[UiBar], &[crate::chart::BaseMinuteStudy], (u64, u64))>,
+    day_source: Option<&[venue_domain::PublicBar]>,
+    minute_facts: Option<&[venue_domain::PublicBar]>,
+    forming_minute: Option<&venue_domain::PublicBar>,
+    mut analysis: Option<(&[analysis::AvwapAnchor], &mut analysis::AnalysisInteraction)>,
+    bar_revision: Option<u64>,
+    oi_samples: Option<&[venue_domain::OpenInterestSample]>,
 ) -> Option<rust_decimal::Decimal> {
     let (price_scale, quantity_scale) = scales;
     let height = ui.available_height().max(1.0);
@@ -65,6 +209,13 @@ pub(crate) fn candle_plot(
         Sense::click_and_drag(),
     );
     painter.rect_filled(response.rect, 0, theme::BG_PRIMARY);
+    let analysis_active = analysis.as_ref().is_some_and(|(_, state)| state.mode != analysis::AnalysisMode::None);
+    if let Some((_, state)) = analysis.as_mut() {
+        state.action = None;
+        if ui.input(|input| input.key_pressed(egui::Key::Escape)) {
+            state.mode = analysis::AnalysisMode::None;
+        }
+    }
     if all_bars.is_empty() {
         painter.text(
             response.rect.center(),
@@ -79,13 +230,21 @@ pub(crate) fn candle_plot(
     let full_rect = response.rect.shrink2(egui::vec2(8.0, 8.0));
     let axis_width =
         price_axis::width(&painter, all_bars, overlays, price_scale).min(full_rect.width() * 0.4);
-    let plot_rect = Rect::from_min_max(full_rect.min, full_rect.max - egui::vec2(axis_width, 0.0));
+    let full_plot_rect = Rect::from_min_max(full_rect.min, full_rect.max - egui::vec2(axis_width, 0.0));
+    let profile_enabled = settings.profile.visible_range || settings.profile.fixed_range;
+    let profile_width = if profile_enabled {
+        (full_plot_rect.width() * f32::from(settings.profile.width_percent) / 100.0)
+            .min(full_plot_rect.width() * 0.35)
+    } else { 0.0 };
+    let plot_rect = Rect::from_min_max(full_plot_rect.min,
+        Pos2::new(full_plot_rect.right() - profile_width, full_plot_rect.bottom()));
     let axis_painter = painter.clone();
     axis_painter.rect_filled(
         Rect::from_min_max(Pos2::new(plot_rect.right(), full_rect.top()), full_rect.max),
         0,
         theme::BG_PRIMARY,
     );
+    let profile_painter = painter.clone();
     let painter = painter.with_clip_rect(plot_rect.intersect(painter.clip_rect()));
     let timeline_height = 16.0_f32.min(plot_rect.height() * 0.14);
     let content_rect = Rect::from_min_max(
@@ -96,7 +255,7 @@ pub(crate) fn candle_plot(
         Pos2::new(plot_rect.left(), content_rect.bottom()),
         plot_rect.max,
     );
-    if response.dragged_by(egui::PointerButton::Primary) {
+    if !analysis_active && response.dragged_by(egui::PointerButton::Primary) {
         ui.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
     } else if response
         .hover_pos()
@@ -118,17 +277,17 @@ pub(crate) fn candle_plot(
     if price_axis.hovered() || price_axis.dragged() {
         ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeVertical);
     }
-    if price_axis.double_clicked() {
+    if !analysis_active && price_axis.double_clicked() {
         viewport.reset_price_scale();
     }
-    if price_axis.dragged_by(egui::PointerButton::Primary) {
+    if !analysis_active && price_axis.dragged_by(egui::PointerButton::Primary) {
         viewport.auto_price_scale = false;
         let delta = ui.input(|input| input.pointer.delta().y);
         viewport.price_zoom_milli = ((viewport.price_zoom_milli.clamp(250, 4000) as f32)
             * (delta * 0.006).exp())
         .clamp(250.0, 4000.0) as u32;
     }
-    if response.hovered() && !price_axis.hovered() {
+    if response.hovered() && !price_axis.hovered() && !analysis_active {
         let steps = ui.input(|input| {
             input
                 .events
@@ -152,7 +311,7 @@ pub(crate) fn candle_plot(
         });
         viewport.zoom_by_grid_steps(all_bars.len(), pointer_ratio, interval, steps);
     }
-    if response.dragged_by(egui::PointerButton::Primary)
+    if !analysis_active && response.dragged_by(egui::PointerButton::Primary)
         && !price_axis.dragged()
         && let Some(delta) = response.total_drag_delta()
     {
@@ -164,6 +323,59 @@ pub(crate) fn candle_plot(
 
     let range = viewport.visible_range(all_bars.len());
     let bars = &all_bars[range.clone()];
+    let flow_points = if settings.microstructure.show_delta || settings.microstructure.show_cvd {
+        let buckets = bars.iter().map(|bar| {
+            let confirmed = study_at(all_studies, bar.open_time_ms).is_some_and(|point| point.confirmed);
+            (bar.open_time_ms, confirmed)
+        }).collect::<Vec<_>>();
+        let revision = minute_source.map(|(_, _, revision)| revision);
+        let key = response.id.with("minute-flow-cache");
+        if market_scope.is_some() && revision.is_some() && minute_facts.is_some() {
+            mark_indicator_cache(ui.ctx(), IndicatorCacheKind::Flow, response.id);
+        } else {
+            ui.ctx().data_mut(|data| { data.remove::<Arc<MinuteFlowCache>>(key); });
+        }
+        let cached = market_scope.zip(revision).filter(|_| minute_facts.is_some())
+            .and_then(|(binding, revision)| {
+            ui.ctx().data(|data| data.get_temp::<Arc<MinuteFlowCache>>(key))
+                .filter(|cache| cache.binding == *binding && cache.revision == revision
+                    && cache.interval_ms == interval.duration_ms()
+                    && cache.reset_mode == settings.microstructure.cvd_reset_mode
+                    && cache.buckets == buckets)
+        });
+        let values = cached.map(|cache| cache.values.clone()).unwrap_or_else(|| {
+            let values = minute_facts.map(|facts| venue_indicators::chart::aggregate_minute_flow(
+                facts, &buckets, interval.duration_ms(), settings.microstructure.cvd_reset_mode))
+                .unwrap_or_else(|| vec![venue_indicators::chart::OrderFlowValue::default(); buckets.len()]);
+            if let Some((binding, revision)) = market_scope.zip(revision)
+                && minute_facts.is_some() {
+                ui.ctx().data_mut(|data| data.insert_temp(key, Arc::new(MinuteFlowCache {
+                    binding: binding.clone(), revision, interval_ms: interval.duration_ms(),
+                    reset_mode: settings.microstructure.cvd_reset_mode, buckets: buckets.clone(),
+                    values: values.clone(),
+                })));
+            }
+            values
+        });
+        buckets.into_iter().zip(values).map(|((open_time_ms, confirmed), order_flow)| ChartStudyPoint {
+            open_time_ms, confirmed, order_flow, ..Default::default()
+        }).collect::<Vec<_>>()
+    } else { Vec::new() };
+    let oi_points = if settings.oi_pane {
+        bars.iter().map(|bar| {
+            let end = bar.open_time_ms.saturating_add(interval.duration_ms());
+            let quantity = oi_samples.and_then(|samples| {
+                let last = samples.partition_point(|sample| sample.exchange_time_ms <= end);
+                last.checked_sub(1).and_then(|index| samples.get(index))
+                    .filter(|sample| sample.exchange_time_ms > bar.open_time_ms)
+                    .and_then(|sample| match &sample.base_quantity {
+                        venue_domain::FieldState::Known(quantity) => Some(*quantity), _ => None,
+                    })
+            });
+            ChartStudyPoint { open_time_ms: bar.open_time_ms, open_interest: quantity,
+                ..Default::default() }
+        }).collect::<Vec<_>>()
+    } else { Vec::new() };
     let display_slots = viewport.display_slots(bars.len());
     let has_local_studies = !all_studies.is_empty();
     let pane_specs = if has_local_studies {
@@ -234,9 +446,14 @@ pub(crate) fn candle_plot(
         .size()
         .y;
     let readout_top = 6.0 + line_height + 2.0;
+    let mut readout_point = study_at(all_studies, readout_time).cloned().unwrap_or_default();
+    if let Some(index) = selected_index && let Some(flow) = flow_points.get(index) {
+        readout_point.order_flow = flow.order_flow;
+    }
     let job = study_readout::job(
         settings,
-        study_at(all_studies, readout_time),
+        Some(&readout_point),
+        selected_index.and_then(|index| bars.get(index)).map(|bar| bar.close),
         price_scale,
         price_rect.width() - 12.0,
     );
@@ -245,24 +462,85 @@ pub(crate) fn candle_plot(
         + study_galley
             .as_ref()
             .map_or(0.0, |galley| galley.size().y + 2.0);
-    let mut price_range = PriceRange::from_bars(bars)?;
+    let raw_range = PriceRange::from_bars(bars)?;
     // Keep the OHLC / study readouts and the high-price leader out of candle space.
     let headroom = (custom_readout_y
-        + if has_local_studies && settings.custom_ema_adx.enabled {
+        + if has_local_studies && settings.effective_custom_legacy().enabled {
             line_height + 8.0
         } else {
             8.0
         })
     .min(price_rect.height() * 0.4);
-    price_range.high += (price_range.high - price_range.low)
-        * f64::from(headroom / (price_rect.height() - headroom));
-    price_range = viewport.resolve_price_scale(price_range);
+    let readout_rect = price_rect;
+    let mut price_rect = price_rect;
+    price_rect.min.y += headroom;
+    let automatic =
+        raw_range.with_tick_height(price_tick.map(decimal_to_f64), price_rect.height(), 4.0);
+    let price_range = viewport.resolve_price_scale(automatic);
+    let mut analysis_used = false;
+    if (response.clicked_by(egui::PointerButton::Primary)
+        || (analysis_active && response.drag_stopped_by(egui::PointerButton::Primary)))
+        && response.interact_pointer_pos().is_some_and(|point| price_rect.contains(point))
+        && let Some(index) = hovered_index
+        && let Some((_, state)) = analysis.as_mut()
+    {
+        let time = bars[index].open_time_ms;
+        let price = bars[index].close;
+        analysis_used = state.select_candle(time, interval.duration_ms(), price);
+    }
+    if profile_enabled {
+        let profile_rect = Rect::from_min_max(
+            Pos2::new(plot_rect.right(), price_rect.top()),
+            Pos2::new(full_plot_rect.right(), price_rect.bottom()),
+        );
+        volume_profile::draw(ui, &profile_painter, response.id, profile_rect, bars,
+            interval.duration_ms(), price_range, price_tick, minute_facts,
+            minute_source.map(|(_, _, revision)| revision), market_scope, &settings.profile);
+    }
     let width = price_rect.width() / display_slots as f32;
     let price_y = |price: f64| {
         price_range
             .price_to_y(price_rect.top(), price_rect.height(), price)
             .unwrap_or(price_rect.center().y)
     };
+    microstructure::draw(
+        ui,
+        &painter,
+        response.id,
+        price_rect,
+        all_bars,
+        all_studies,
+        interval.duration_ms(),
+        range.clone(),
+        display_slots,
+        price_range,
+        &settings.microstructure,
+        language,
+        depth,
+        market_scope,
+        minute_source,
+        price_tick,
+    );
+    if let Some(days) = day_source {
+        session_levels::draw(&painter, price_rect, bars, display_slots,
+            price_range, price_scale, days, &settings.session);
+    }
+    if settings.session.sr_current {
+        support_resistance::draw(ui, &painter, response.id, price_rect,
+            all_bars, all_studies, range.clone(), display_slots, interval.duration_ms(),
+            price_range, price_tick, market_scope, bar_revision);
+    }
+    if settings.session.sr_15m || settings.session.sr_1h || settings.session.sr_1d {
+        support_resistance::draw_higher(ui, &painter, response.id, price_rect,
+            bars, display_slots, interval.duration_ms(), price_range, price_tick,
+            market_scope, minute_facts, day_source,
+            [settings.session.sr_15m, settings.session.sr_1h, settings.session.sr_1d]);
+    }
+    if let Some((anchors, _)) = analysis.as_ref() {
+        analysis::draw_anchors(ui, response.id, &painter, price_rect, bars, display_slots,
+            interval.duration_ms(), price_range, minute_facts, forming_minute,
+            minute_source.map(|(_, _, revision)| revision), market_scope, anchors);
+    }
     for price in price_range.grid_prices(price_scale, 5) {
         let y = price_y(price);
         painter.line_segment(
@@ -302,7 +580,7 @@ pub(crate) fn candle_plot(
     }
     let maximum_volume = bars
         .iter()
-        .map(|bar| decimal_to_f64(bar.volume))
+        .filter_map(|bar| bar.volume.map(decimal_to_f64))
         .fold(0.0_f64, f64::max)
         .max(f64::EPSILON);
     if has_local_studies {
@@ -317,6 +595,29 @@ pub(crate) fn candle_plot(
         );
     }
     let candle_painter = painter.with_clip_rect(price_rect.intersect(painter.clip_rect()));
+    let custom_ids: Vec<u64> = settings
+        .custom_library
+        .as_ref()
+        .map(|l| {
+            l.entries
+                .iter()
+                .filter(|e| e.enabled)
+                .map(|e| e.id)
+                .collect()
+        })
+        .unwrap_or_default();
+    if has_local_studies {
+        crate::custom_indicator::draw_scripts(
+            &painter,
+            price_rect,
+            bars,
+            display_slots,
+            all_studies,
+            price_y,
+            true,
+            &custom_ids,
+        );
+    }
     for (index, bar) in bars.iter().enumerate() {
         let open = decimal_to_f64(bar.open);
         let close = decimal_to_f64(bar.close);
@@ -327,28 +628,26 @@ pub(crate) fn candle_plot(
         } else {
             theme::SELL
         };
-        candle_painter.line_segment(
+        candles::draw(
+            &candle_painter,
+            x,
+            width,
             [
-                Pos2::new(x, price_y(decimal_to_f64(bar.low))),
-                Pos2::new(x, price_y(decimal_to_f64(bar.high))),
+                price_y(open),
+                price_y(decimal_to_f64(bar.high)),
+                price_y(decimal_to_f64(bar.low)),
+                price_y(close),
             ],
-            Stroke::new(1.0, color),
+            color,
         );
-        let top = price_y(open.max(close));
-        let bottom = price_y(open.min(close));
-        let body = Rect::from_min_max(
-            Pos2::new(x - width * 0.31, top),
-            Pos2::new(x + width * 0.31, bottom.max(top + 1.0)),
-        );
-        candle_painter.rect_filled(body, 0.5, color);
-        if let Some(volume_rect) = volume_rect {
+        if let (Some(volume_rect), Some(volume)) = (volume_rect, bar.volume) {
             let color = if close >= open {
                 settings.volume.color()
             } else {
                 settings.volume.secondary_color()
             };
             let volume_height =
-                (decimal_to_f64(bar.volume) / maximum_volume) as f32 * volume_rect.height();
+                (decimal_to_f64(volume) / maximum_volume) as f32 * volume_rect.height();
             painter.rect_filled(
                 Rect::from_min_max(
                     Pos2::new(x - width * 0.31, volume_rect.bottom() - volume_height),
@@ -384,7 +683,7 @@ pub(crate) fn candle_plot(
         );
         if let Some(galley) = study_galley {
             painter.galley(
-                price_rect.left_top() + egui::vec2(6.0, readout_top),
+                readout_rect.left_top() + egui::vec2(6.0, readout_top),
                 galley,
                 theme::TEXT_PRIMARY,
             );
@@ -395,21 +694,36 @@ pub(crate) fn candle_plot(
             bars,
             display_slots,
             all_studies,
-            &settings.custom_ema_adx,
+            &settings.effective_custom_legacy(),
             price_y,
             readout_time,
             price_scale,
             settings.chart_text_size,
             language,
-            custom_readout_y,
+            custom_readout_y - headroom,
+        );
+        crate::custom_indicator::draw_scripts(
+            &painter,
+            price_rect,
+            bars,
+            display_slots,
+            all_studies,
+            price_y,
+            false,
+            &custom_ids,
         );
         for (spec, rect) in pane_specs.iter().zip(sub_rects) {
+            let points = if spec.label.starts_with("Delta") || spec.label.starts_with("CVD") {
+                flow_points.as_slice()
+            } else if spec.label.starts_with("OI") {
+                oi_points.as_slice()
+            } else { all_studies };
             draw_sub_pane(
                 &painter,
                 rect,
                 bars,
                 display_slots,
-                all_studies,
+                points,
                 spec,
                 settings.chart_text_size,
                 selected_index,
@@ -558,7 +872,7 @@ pub(crate) fn candle_plot(
     if let Some(index) = selected_index {
         draw_candle_readout(
             &painter,
-            price_rect,
+            readout_rect,
             bars,
             index,
             language,
@@ -579,6 +893,7 @@ pub(crate) fn candle_plot(
         price_scale,
         settings.chart_text_size,
     );
+    if analysis_active || analysis_used { return None; }
     response
         .clicked()
         .then(|| response.interact_pointer_pos())
@@ -660,7 +975,7 @@ fn draw_candle_readout(
         ),
         (
             text(language, TextKey::Volume),
-            format_decimal(bar.volume, quantity_scale),
+            bar.volume.map_or_else(|| "—".to_owned(), |volume| format_decimal(volume, quantity_scale)),
         ),
     ] {
         stats.append(&format!("{label} "), 0.0, label_format.clone());
@@ -1057,6 +1372,33 @@ fn pane_specs(settings: &ChartDisplaySettings) -> Vec<PaneSpec> {
         }
     };
     add(
+        settings.microstructure.show_delta,
+        "Delta · base".into(),
+        [None, None, Some(|p| p.order_flow.delta)],
+        ["", "", "Delta"],
+        crate::chart_settings::IndicatorStyle::new(true, [240, 185, 11], [14, 203, 129]),
+        PaneScale::Symmetric,
+        true,
+    );
+    add(
+        settings.microstructure.show_cvd,
+        "CVD · base".into(),
+        [Some(|p| p.order_flow.cumulative), None, None],
+        ["CVD", "", ""],
+        crate::chart_settings::IndicatorStyle::new(true, [240, 185, 11], [14, 203, 129]),
+        PaneScale::Auto,
+        false,
+    );
+    add(
+        settings.oi_pane,
+        "OI · base".into(),
+        [Some(|p| p.open_interest), None, None],
+        ["OI", "", ""],
+        crate::chart_settings::IndicatorStyle::new(true, [91, 159, 255], [91, 159, 255]),
+        PaneScale::Positive,
+        false,
+    );
+    add(
         settings.macd.enabled,
         format!(
             "MACD({},{},{})",
@@ -1259,6 +1601,7 @@ fn draw_sub_pane(
         let normalized = ((value - low) / (high - low)).clamp(0.0, 1.0);
         rect.bottom() - normalized as f32 * rect.height() * 0.88
     };
+    let precision = sub_pane_precision(low, high, rect.height());
     for level in spec
         .reference_levels
         .iter()
@@ -1335,7 +1678,7 @@ fn draw_sub_pane(
                 readout.append(&format!("  {series_label} "), 0.0, label_format.clone());
             }
             readout.append(
-                &format_f64_fixed(decimal_to_f64(value), 6),
+                &format_f64_fixed(decimal_to_f64(value), precision),
                 0.0,
                 egui::TextFormat {
                     color: if spec.histogram && index == 2 {
@@ -1360,7 +1703,8 @@ fn volume_readout(bars: &[UiBar], selected_index: Option<usize>, quantity_scale:
         .and_then(|index| bars.get(index))
         .map_or_else(
             || "VOL".to_owned(),
-            |bar| format!("VOL  {}", format_decimal(bar.volume, quantity_scale)),
+            |bar| format!("VOL  {}", bar.volume.map_or_else(|| "—".to_owned(),
+                |volume| format_decimal(volume, quantity_scale))),
         )
 }
 fn study_at(studies: &[ChartStudyPoint], open_time_ms: u64) -> Option<&ChartStudyPoint> {
@@ -1427,345 +1771,14 @@ fn format_f64_fixed(value: f64, precision: usize) -> String {
     format!("{value:.precision$}")
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use rust_decimal::Decimal;
-
-    fn fixture() -> (Vec<UiBar>, Vec<ChartStudyPoint>) {
-        let bars = (0..6)
-            .map(|i| UiBar {
-                open_time_ms: i * 60_000,
-                open: Decimal::from(50),
-                high: Decimal::from(55),
-                low: Decimal::from(45),
-                close: Decimal::from(52),
-                volume: Decimal::ONE,
-            })
-            .collect::<Vec<_>>();
-        let studies = bars
-            .iter()
-            .enumerate()
-            .map(|(i, bar)| ChartStudyPoint {
-                open_time_ms: bar.open_time_ms,
-                supertrend: Some(Decimal::from(if i < 3 { 40 } else { 60 })),
-                supertrend_rising: i < 3,
-                bollinger_upper: Some(Decimal::from(70)),
-                bollinger_lower: Some(Decimal::from(30)),
-                ..Default::default()
-            })
-            .collect();
-        (bars, studies)
+fn sub_pane_precision(low: f64, high: f64, height: f32) -> usize {
+    let resolution = (high - low).abs() / f64::from(height.max(1.0));
+    if !resolution.is_finite() || resolution <= 0.0 {
+        return 2;
     }
-
-    fn render(draw: impl Fn(&egui::Painter, Rect)) -> Vec<egui::epaint::ClippedShape> {
-        let ctx = egui::Context::default();
-        let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
-            let painter = ui.ctx().layer_painter(egui::LayerId::background());
-            draw(
-                &painter,
-                Rect::from_min_size(Pos2::ZERO, egui::vec2(300.0, 100.0)),
-            );
-        });
-        output.textures_delta.clear();
-        output.shapes
-    }
-
-    fn pointer_frame(
-        context: &egui::Context,
-        viewport: &mut crate::chart::ChartViewport,
-        bars: &[UiBar],
-        events: Vec<egui::Event>,
-    ) -> bool {
-        let mut selected = None;
-        let mut output = context.run_ui(
-            egui::RawInput {
-                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, egui::vec2(1_200.0, 500.0))),
-                events,
-                ..Default::default()
-            },
-            |ui| {
-                selected = candle_plot(
-                    ui,
-                    bars,
-                    &[],
-                    viewport,
-                    Language::English,
-                    &ChartDisplaySettings::default(),
-                    (2, 2),
-                    crate::chart::ChartInterval::OneMinute,
-                    None,
-                    None,
-                    &crate::chart_trading::ChartTradingSettings::default(),
-                    &[],
-                    (None, None),
-                );
-            },
-        );
-        output.textures_delta.clear();
-        selected.is_some()
-    }
-
-    #[test]
-    fn left_drag_in_chart_and_timeline_keeps_padding_after_release() {
-        for y in [200.0, 480.0] {
-            for button in [egui::PointerButton::Primary, egui::PointerButton::Secondary] {
-                let context = egui::Context::default();
-                let mut viewport = crate::chart::ChartViewport::default();
-                let (seed, _) = fixture();
-                let mut bars = seed.into_iter().cycle().take(500).collect::<Vec<_>>();
-                for (index, bar) in bars.iter_mut().enumerate() {
-                    bar.open_time_ms = index as u64 * 60_000;
-                }
-                pointer_frame(&context, &mut viewport, &bars, vec![]);
-                pointer_frame(
-                    &context,
-                    &mut viewport,
-                    &bars,
-                    vec![
-                        egui::Event::PointerMoved(egui::pos2(900.0, y)),
-                        egui::Event::PointerButton {
-                            pos: egui::pos2(900.0, y),
-                            button,
-                            pressed: true,
-                            modifiers: egui::Modifiers::NONE,
-                        },
-                    ],
-                );
-                pointer_frame(
-                    &context,
-                    &mut viewport,
-                    &bars,
-                    vec![egui::Event::PointerMoved(egui::pos2(800.0, y))],
-                );
-                let first_padding = viewport.right_padding();
-                pointer_frame(
-                    &context,
-                    &mut viewport,
-                    &bars,
-                    vec![egui::Event::PointerMoved(egui::pos2(700.0, y))],
-                );
-                let final_padding = viewport.right_padding();
-                if button == egui::PointerButton::Primary {
-                    assert!(first_padding > 0);
-                    assert!(final_padding > first_padding);
-                } else {
-                    assert_eq!(final_padding, 0);
-                }
-                assert!(!pointer_frame(
-                    &context,
-                    &mut viewport,
-                    &bars,
-                    vec![egui::Event::PointerButton {
-                        pos: egui::pos2(700.0, y),
-                        button,
-                        pressed: false,
-                        modifiers: egui::Modifiers::NONE,
-                    },]
-                ));
-                pointer_frame(&context, &mut viewport, &bars, vec![]);
-                assert_eq!(viewport.right_padding(), final_padding);
-                assert_eq!(viewport.right_offset(), 0);
-                let visible = viewport.visible_range(bars.len() + 1);
-                assert_eq!(visible.end, bars.len() + 1);
-                assert_eq!(viewport.right_padding(), final_padding);
-            }
-        }
-    }
-
-    #[test]
-    fn price_axis_drag_changes_height_without_panning_or_selecting_price() {
-        let context = egui::Context::default();
-        let mut viewport = crate::chart::ChartViewport::default();
-        let (bars, _) = fixture();
-        pointer_frame(&context, &mut viewport, &bars, vec![]);
-        pointer_frame(
-            &context,
-            &mut viewport,
-            &bars,
-            vec![
-                egui::Event::PointerMoved(egui::pos2(1160.0, 150.0)),
-                egui::Event::PointerButton {
-                    pos: egui::pos2(1160.0, 150.0),
-                    button: egui::PointerButton::Primary,
-                    pressed: true,
-                    modifiers: egui::Modifiers::NONE,
-                },
-            ],
-        );
-        pointer_frame(
-            &context,
-            &mut viewport,
-            &bars,
-            vec![egui::Event::PointerMoved(egui::pos2(1160.0, 210.0))],
-        );
-        assert!(viewport.price_zoom_milli > 1000);
-        assert!(!viewport.auto_price_scale);
-        assert_eq!(viewport.right_padding(), 0);
-        assert!(!pointer_frame(
-            &context,
-            &mut viewport,
-            &bars,
-            vec![egui::Event::PointerButton {
-                pos: egui::pos2(1160.0, 210.0),
-                button: egui::PointerButton::Primary,
-                pressed: false,
-                modifiers: egui::Modifiers::NONE
-            }]
-        ));
-        viewport.reset();
-        assert_eq!(viewport.price_zoom_milli, 1000);
-        assert!(viewport.auto_price_scale);
-    }
-
-    #[test]
-    fn candles_are_clipped_before_the_separate_price_axis() {
-        let context = egui::Context::default();
-        let mut viewport = crate::chart::ChartViewport::default();
-        let (bars, _) = fixture();
-        let mut output = context.run_ui(
-            egui::RawInput {
-                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, egui::vec2(1200.0, 500.0))),
-                ..Default::default()
-            },
-            |ui| {
-                candle_plot(
-                    ui,
-                    &bars,
-                    &[],
-                    &mut viewport,
-                    Language::English,
-                    &ChartDisplaySettings::default(),
-                    (2, 2),
-                    crate::chart::ChartInterval::OneMinute,
-                    None,
-                    None,
-                    &crate::chart_trading::ChartTradingSettings::default(),
-                    &[],
-                    (None, None),
-                );
-            },
-        );
-        output.textures_delta.clear();
-        let axis_left = output
-            .shapes
-            .iter()
-            .filter_map(|shape| {
-                if let egui::Shape::Rect(rect) = &shape.shape
-                    && rect.fill == theme::BG_PRIMARY
-                    && rect.rect.left() > 900.0
-                {
-                    Some(rect.rect.left())
-                } else {
-                    None
-                }
-            })
-            .reduce(f32::min)
-            .unwrap_or(0.0);
-        assert!(axis_left > 900.0);
-        let candles = output.shapes.iter().filter(|shape| matches!(&shape.shape,
-            egui::Shape::Rect(rect) if (rect.fill == theme::BUY || rect.fill == theme::SELL) && rect.rect.center().x < axis_left)).collect::<Vec<_>>();
-        assert!(!candles.is_empty());
-        assert!(
-            candles
-                .iter()
-                .all(|shape| shape.clip_rect.right() <= axis_left)
-        );
-    }
-
-    #[test]
-    fn supertrend_breaks_lines_at_reversals_and_missing_studies() {
-        let (bars, mut studies) = fixture();
-        studies.remove(1);
-        let shapes = render(|painter, rect| {
-            draw_directional_price(
-                painter,
-                rect,
-                &bars,
-                6,
-                &studies,
-                |p| p.supertrend,
-                |p| p.supertrend_rising,
-                ChartDisplaySettings::default().supertrend,
-                |v| v as f32,
-                true,
-            );
-        });
-        let lines = shapes
-            .iter()
-            .filter_map(|shape| match &shape.shape {
-                egui::Shape::LineSegment { points, stroke } => Some((points, stroke)),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(lines.len(), 2);
-        assert!(
-            lines
-                .iter()
-                .all(|(points, stroke)| points[0].x >= 175.0 && stroke.color == theme::SELL)
-        );
-    }
-
-    #[test]
-    fn trend_fill_stays_between_trend_and_body_and_stops_at_reversal() {
-        let (bars, studies) = fixture();
-        let mut settings = ChartDisplaySettings::default();
-        settings.supertrend.enabled = true;
-        let shapes = render(|painter, rect| {
-            draw_price_fills(painter, rect, &bars, 6, &studies, |v| v as f32, &settings)
-        });
-        let meshes = shapes
-            .iter()
-            .filter_map(|shape| match &shape.shape {
-                egui::Shape::Mesh(mesh) => Some(mesh),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(meshes.len(), 4);
-        for mesh in meshes {
-            assert!(
-                mesh.vertices
-                    .iter()
-                    .all(|v| (40.0..=60.0).contains(&v.pos.y))
-            );
-            let min_x = mesh
-                .vertices
-                .iter()
-                .map(|v| v.pos.x)
-                .fold(f32::INFINITY, f32::min);
-            let max_x = mesh
-                .vertices
-                .iter()
-                .map(|v| v.pos.x)
-                .fold(f32::NEG_INFINITY, f32::max);
-            assert!(max_x <= 125.0 || min_x >= 175.0);
-        }
-    }
-
-    #[test]
-    fn enabled_band_fill_does_not_bridge_missing_values() {
-        let (bars, mut studies) = fixture();
-        studies[2].bollinger_upper = None;
-        let mut settings = ChartDisplaySettings::default();
-        settings.bollinger.enabled = true;
-        let shapes = render(|painter, rect| {
-            draw_price_fills(painter, rect, &bars, 6, &studies, |v| v as f32, &settings)
-        });
-        assert_eq!(
-            shapes
-                .iter()
-                .filter(|s| matches!(s.shape, egui::Shape::Mesh(_)))
-                .count(),
-            3
-        );
-        assert!(shapes.iter().all(|s| s.clip_rect.max.y <= 100.0));
-    }
-
-    #[test]
-    fn hover_readout_measures_price_against_latest_trade() {
-        let change = hover_price_change_percent(0.089_350, Some(Decimal::new(8_893, 5)));
-        assert!(change.is_some_and(|change| (change - 0.472_281_57).abs() < 0.000_001));
-        assert_eq!(format_f64_fixed(0.0889, 5), "0.08890");
-        assert_eq!(hover_price_change_percent(1.0, Some(Decimal::ZERO)), None);
-    }
+    (-resolution.log10().floor()).clamp(0.0, 12.0) as usize
 }
+
+#[cfg(test)]
+#[path = "chart_view/tests.rs"]
+mod tests;

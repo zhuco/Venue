@@ -205,7 +205,7 @@ pub(super) fn normalize_private_stream_event_for_symbols(
                         | "MARGIN_TRANSFER"
                 )
             })
-        && value
+        && (value
             .pointer("/a/P")
             .and_then(Value::as_array)
             .is_some_and(|positions| {
@@ -220,6 +220,10 @@ pub(super) fn normalize_private_stream_event_for_symbols(
                         })
                 })
             })
+            || value
+                .pointer("/a/B")
+                .and_then(Value::as_array)
+                .is_some_and(|balances| !balances.is_empty()))
     {
         return Ok(Some(BinancePrivateAccountEvent::RefreshRecommended));
     }

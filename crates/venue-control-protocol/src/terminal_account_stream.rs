@@ -7,6 +7,7 @@ use crate::kol::{
 use serde::{Deserialize, Serialize};
 
 pub const COMPACT_QUERY: &str = "compact=1";
+pub const ASSET_CLOCK_QUERY: &str = "compact=1&asset_clock=1";
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(
@@ -18,6 +19,8 @@ pub const COMPACT_QUERY: &str = "compact=1";
 pub enum TerminalAccountStreamEvent {
     Snapshot(Option<TerminalAccountProjection>),
     Update {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        balance_observed_ms: Option<u64>,
         base_observed_ms: u64,
         credential_id: String,
         trading_account_id: String,
@@ -53,6 +56,7 @@ impl TerminalAccountStreamEvent {
             return Self::Snapshot(Some(current.clone()));
         }
         Self::Update {
+            balance_observed_ms: current.balance_observed_ms,
             base_observed_ms: previous.observed_ms,
             credential_id: current.credential_id.clone(),
             trading_account_id: current.trading_account_id.clone(),
@@ -75,9 +79,28 @@ impl TerminalAccountStreamEvent {
         self,
         previous: &mut Option<TerminalAccountProjection>,
     ) -> Result<(), KolProtocolError> {
+        *previous = self.project(previous.as_ref())?;
+        Ok(())
+    }
+
+    /// Shared publication avoids cloning all unchanged fields again at the UI channel.
+    /// Validation completes before replacing the previous baseline in either API.
+    pub fn apply_shared(
+        self,
+        previous: &mut Option<std::sync::Arc<TerminalAccountProjection>>,
+    ) -> Result<(), KolProtocolError> {
+        *previous = self.project(previous.as_deref())?.map(std::sync::Arc::new);
+        Ok(())
+    }
+
+    fn project(
+        self,
+        previous: Option<&TerminalAccountProjection>,
+    ) -> Result<Option<TerminalAccountProjection>, KolProtocolError> {
         let next = match self {
             Self::Snapshot(projection) => projection,
             Self::Update {
+                balance_observed_ms,
                 base_observed_ms,
                 credential_id,
                 trading_account_id,
@@ -92,9 +115,7 @@ impl TerminalAccountStreamEvent {
                 position_history,
                 assets,
             } => {
-                let base = previous
-                    .as_ref()
-                    .ok_or(KolProtocolError::TerminalProjection)?;
+                let base = previous.ok_or(KolProtocolError::TerminalProjection)?;
                 if base.credential_id != credential_id
                     || base.trading_account_id != trading_account_id
                     || base.private_generation != private_generation
@@ -109,6 +130,7 @@ impl TerminalAccountStreamEvent {
                 if let Some(value) = position_mode {
                     projection.position_mode = value;
                 }
+                projection.balance_observed_ms = balance_observed_ms;
                 if let Some(value) = positions {
                     projection.positions = value;
                 }
@@ -133,8 +155,7 @@ impl TerminalAccountStreamEvent {
         if let Some(projection) = &next {
             projection.validate()?;
         }
-        *previous = next;
-        Ok(())
+        Ok(next)
     }
 }
 

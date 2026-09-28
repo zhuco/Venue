@@ -19,7 +19,15 @@ $lease = Enter-VenueBuildGuard -RepoRoot $repo -Slot $Slot
 try {
     Push-Location -LiteralPath $repo
     try {
-        & cargo @CargoArguments
+        $cargoInvocation = @()
+        if (-not $lease.Plan.HostedCI -and $lease.Plan.Slot -eq 'main') {
+            # A global Cargo config can choose sccache even when the corresponding
+            # environment variable is empty. This CLI config has higher precedence.
+            # TOML's literal empty string survives PowerShell's native argument quoting.
+            $cargoInvocation += @('--config', "build.rustc-wrapper=''" )
+        }
+        $cargoInvocation += $CargoArguments
+        & cargo @cargoInvocation
         $cargoExit = $LASTEXITCODE
         if ($cargoExit -ne 0) { throw "Cargo failed with exit code $cargoExit." }
         $null = Test-VenueBuildAdmission $lease.Plan

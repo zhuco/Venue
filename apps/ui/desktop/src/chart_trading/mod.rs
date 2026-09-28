@@ -58,6 +58,7 @@ pub(crate) fn quick_order(
                         .changed()
                     {
                         model.trade_dock.armed_action = None;
+                        model.remember_manual_quote_amount();
                     }
                 }
                 for (visible, action) in [

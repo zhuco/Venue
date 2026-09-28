@@ -1,7 +1,7 @@
 //! Secret-free public display data. It conveys no account or execution permission.
 use rust_decimal::Decimal;
 use serde_json::Value;
-use venue_domain::{FieldState, Price, PublicBar, Symbol, UnknownReason};
+use venue_domain::{FieldState, OpenInterestUnit, Price, PublicBar, Symbol, UnknownReason};
 
 pub mod clock;
 
@@ -14,6 +14,10 @@ pub fn received_ms() -> Result<u64> {
 #[derive(Clone, Debug)]
 pub struct Instrument {
     pub symbol: Symbol,
+    /// Exchange catalogue identity; may differ from BASE+QUOTE (for example Bitget USDC perps).
+    pub native_symbol: String,
+    /// None when the venue has price-dependent precision rather than one fixed tick.
+    pub price_tick: Option<Decimal>,
     pub price_scale: u32,
     pub quantity_scale: u32,
     pub contract_size: Decimal,
@@ -26,6 +30,26 @@ pub struct Quote {
     pub change_percent: Decimal,
     pub quote_volume: Option<Decimal>,
     pub time_ms: u64,
+    /// Optional same-response normalized perpetual context; never inferred from another symbol.
+    pub derivatives: Option<DerivativeQuote>,
+}
+
+#[derive(Clone, Debug)]
+pub struct DerivativeQuote {
+    /// Only for a public snapshot that has no native timestamp at all.
+    pub use_local_observation_time: bool,
+    pub funding_rate: Option<Decimal>,
+    /// Native timestamp of the funding snapshot when it differs from the ticker timestamp.
+    pub funding_time_ms: Option<u64>,
+    pub next_funding_time_ms: Option<u64>,
+    pub mark_price: Option<Decimal>,
+    pub index_price: Option<Decimal>,
+    /// Present only when the adapter can prove that the native quantity is base asset.
+    pub open_interest_base: Option<Decimal>,
+    pub open_interest_native_quantity: Option<Decimal>,
+    pub open_interest_native_unit: Option<OpenInterestUnit>,
+    /// Native timestamp of the OI snapshot when it differs from the ticker timestamp.
+    pub open_interest_time_ms: Option<u64>,
 }
 
 pub fn trade(

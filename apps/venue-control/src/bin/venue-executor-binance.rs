@@ -3,7 +3,6 @@
 //! This binary assembles the singleton's restricted PostgreSQL and master-key boundaries. It
 //! never reads Binance API secrets from environment variables.
 
-use sqlx::postgres::PgPoolOptions;
 use std::{collections::BTreeMap, future::Future};
 use venue_control::{
     BinanceExecutorSingleton, BinanceGridRuntime, BinanceGridStore,
@@ -24,6 +23,9 @@ use venue_gateway_binance::{
     BinancePrivateAccountEvent, BinancePrivateFillEvent, BinanceTransportLimits, GatewayBinding,
     GatewayMode, VenueId,
 };
+
+#[path = "venue-executor-binance/background.rs"]
+mod background;
 
 const EXECUTOR_HTTP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 const EXECUTOR_MAX_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
@@ -67,15 +69,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Err("usage: venue-executor-binance [inspect-account CREDENTIAL SYMBOL]".into());
     }
     let singleton = BinanceExecutorSingleton::acquire(&launch.database_url).await?;
-    let pool = PgPoolOptions::new()
-        .max_connections(8)
-        .connect(&launch.database_url)
-        .await?;
-    let store = PgExecutorStore::new(pool.clone());
+    let database = background::connect_database(&launch.database_url).await?;
+    let command_pool = database.command;
+    let pool = database.background;
+    let store = PgExecutorStore::new(command_pool.clone());
+    let background_store = PgExecutorStore::new(pool.clone());
     let projection_store = BinancePrivateProjectionStore::new(pool.clone());
     let grid_store = BinanceGridStore::new(pool.clone());
     let mm_store = venue_control::inventory_mm::InventoryMmStore::new(pool.clone());
-    let secrets = ExecutorSecretProvider::new(pool.clone(), CredentialCipher::from_environment()?);
+    let secrets = ExecutorSecretProvider::new(command_pool, CredentialCipher::from_environment()?);
+    let background_secrets =
+        ExecutorSecretProvider::new(pool.clone(), CredentialCipher::from_environment()?);
     let hot_dispatch = GridHotDispatchCache::new();
     let exchange = BinanceExecutionRouter::with_hot_dispatch(
         BinanceTransportLimits::new(EXECUTOR_HTTP_TIMEOUT, EXECUTOR_MAX_RESPONSE_BYTES)?,
@@ -133,10 +137,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tokio::sync::mpsc::channel(GRID_PRIVATE_STREAM_CHANNEL_CAPACITY);
     let (grid_recovery_tx, grid_recovery_rx) =
         tokio::sync::mpsc::channel(GRID_PRIVATE_RECOVERY_CHANNEL_CAPACITY);
-    tokio::spawn(run_projection_supervisor(
-        store.clone(),
+    let projection_task = tokio::spawn(run_projection_supervisor(
+        background_store,
         projection_store.clone(),
-        secrets.clone(),
+        background_secrets.clone(),
         command_wake.clone(),
         hot_dispatch.clone(),
         exchange,
@@ -153,12 +157,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         command_wake.clone(),
         hot_dispatch,
     )
-    .with_risk_credentials(secrets.clone());
+    .with_risk_credentials(background_secrets.clone());
     let grid_task = tokio::spawn(grid_runtime.run_until_shutdown(shutdown_rx.clone()));
     let mm_runtime = venue_control::inventory_mm::InventoryMmRuntime::new(
         mm_store,
         projection_store,
-        secrets.clone(),
+        background_secrets,
         BinanceTransportLimits::new(EXECUTOR_HTTP_TIMEOUT, EXECUTOR_MAX_RESPONSE_BYTES)?,
         command_wake,
     );
@@ -184,8 +188,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let result = runtime.run_until_shutdown(shutdown_rx).await;
     let _ = shutdown_tx.send(true);
     // Drain all mutation workers before propagating any sibling failure and dropping the lock.
-    let (clock_result, grid_result, mirror_result, strategy_result, mm_result) =
-        tokio::join!(clock_task, grid_task, mirror_task, strategy_task, mm_task);
+    let (clock_result, grid_result, mirror_result, strategy_result, mm_result, projection_result) = tokio::join!(
+        clock_task,
+        grid_task,
+        mirror_task,
+        strategy_task,
+        mm_task,
+        projection_task
+    );
+    projection_result?;
     mm_result??;
     strategy_result?;
     clock_result?;
@@ -197,6 +208,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 enum ProjectionMessage {
+    StreamSnapshotSettled {
+        credential_id: String,
+        worker_id: u64,
+        result: Result<Option<bool>, ()>,
+        completion: std::sync::mpsc::SyncSender<Result<Option<bool>, ()>>,
+    },
     StreamSnapshot {
         worker_id: u64,
         source: ActiveProjectionSource,
@@ -239,6 +256,26 @@ struct ProjectionWorker {
     persistence_in_flight: bool,
 }
 
+#[derive(Default)]
+struct ProjectionRestartBackoff {
+    failures: u32,
+    retry_at: Option<std::time::Instant>,
+}
+
+impl ProjectionRestartBackoff {
+    fn ready(&self, now: std::time::Instant) -> bool {
+        self.retry_at.is_none_or(|deadline| now >= deadline)
+    }
+
+    fn failed(&mut self, now: std::time::Instant) {
+        self.failures = self.failures.saturating_add(1);
+        let shift = self.failures.saturating_sub(1).min(5);
+        let delay =
+            std::time::Duration::from_secs(3_u64 << shift).min(std::time::Duration::from_secs(60));
+        self.retry_at = Some(now + delay);
+    }
+}
+
 async fn run_projection_supervisor(
     executor_store: PgExecutorStore,
     projection_store: BinancePrivateProjectionStore,
@@ -252,6 +289,8 @@ async fn run_projection_supervisor(
 ) {
     let (message_tx, mut message_rx) = tokio::sync::mpsc::channel(32);
     let mut workers = BTreeMap::<String, ProjectionWorker>::new();
+    // Restarting a failed bootstrap must not reset its account's REST retry budget.
+    let mut restart_backoff = BTreeMap::<String, ProjectionRestartBackoff>::new();
     let mut next_worker_id = 0_u64;
     let mut discovery = tokio::time::interval(PROJECTION_DISCOVERY_INTERVAL);
     let mut recovery_open = true;
@@ -261,7 +300,7 @@ async fn run_projection_supervisor(
             changed = shutdown.changed() => {
                 if changed.is_err() || *shutdown.borrow() {
                     for (_, worker) in workers { let _ = worker.stop.send(true); }
-                    persistence_tasks.abort_all();
+                    persistence_tasks.shutdown().await;
                     return;
                 }
             }
@@ -334,27 +373,39 @@ async fn run_projection_supervisor(
                     }
                 }
                 Some(ProjectionMessage::StreamSnapshot { worker_id, source, snapshot, completion }) => {
-                    if !is_current_worker(&workers, &source.credential_id, worker_id) {
+                    if !begin_projection_persistence(&mut workers, &source.credential_id, worker_id) {
                         let _ = completion.send(Err(()));
                         continue;
                     }
-                    let ready = projection_store.stream_surface_settled(&source, &snapshot).await;
-                    if !matches!(ready, Ok(Some(true))) {
-                        let _ = completion.send(ready.map_err(|_| ()));
-                        continue;
+                    let projection_store = projection_store.clone();
+                    background::spawn_stream_snapshot(
+                        &mut persistence_tasks, message_tx.clone(), source.credential_id.clone(),
+                        worker_id, completion, async move {
+                            let ready = projection_store.stream_surface_settled(&source, &snapshot).await.map_err(|_| ())?;
+                            if ready != Some(true) {
+                                if let Ok(now) = now_ms() {
+                                    if projection_store.persist_display(&source, &snapshot, now).await.is_err() {
+                                        tracing::warn!(credential_id = %source.credential_id, "Authenticated display projection unavailable");
+                                    }
+                                }
+                                return Ok(ready);
+                            }
+                            projection_store.persist(&source, &snapshot, now_ms().map_err(|_| ())?).await.map_err(|_| ())?;
+                            // Periodic snapshots do not interrupt the Grid cold turn. Fill and
+                            // invalidation signals retain their existing durable ordering.
+                            Ok(Some(true))
+                        },
+                    );
+                }
+                Some(ProjectionMessage::StreamSnapshotSettled { credential_id, worker_id, result, completion }) => {
+                    let current = finish_projection_persistence(&mut workers, &credential_id, worker_id, result.is_ok());
+                    if current && result.is_err() {
+                        restart_backoff.entry(credential_id.clone()).or_default().failed(std::time::Instant::now());
+                        hot_dispatch.invalidate_credential(&credential_id);
+                        let _ = projection_store.invalidate_stream(&credential_id).await;
+                        let _ = grid_signal.try_send(GridPrivateStreamSignal::Invalidate { credential_id });
                     }
-                    let persisted = match now_ms() {
-                        Ok(now) => projection_store.persist(&source, &snapshot, now).await.is_ok(),
-                        Err(_) => false,
-                    };
-                    if !persisted { let _ = completion.send(Err(())); continue; }
-                    // The durable snapshot is already locally checked against the desired surface
-                    // with no account command in flight. Sending it back through the Grid runner
-                    // every 500 ms used to cancel an unrelated cold turn while SQLx owned a
-                    // transaction, leaving PostgreSQL transaction notices and starving that turn.
-                    // Fill and invalidation signals remain immediate; ordinary convergence runs on
-                    // its own two-second schedule against this persisted signed projection.
-                    let _ = completion.send(Ok(Some(true)));
+                    let _ = completion.send(if current { result } else { Err(()) });
                 }
                 Some(ProjectionMessage::Snapshot {
                     worker_id,
@@ -399,7 +450,10 @@ async fn run_projection_supervisor(
                                 },
                             )
                             .await
-                            .unwrap_or(false);
+                            .unwrap_or_else(|_| {
+                                tracing::warn!(credential_id = %source.credential_id, fills = snapshot.fills().len(), phase = "persist_timeout", "Account projection bootstrap failed");
+                                false
+                            });
                             if persisted {
                                 command_wake.wake();
                             }
@@ -429,12 +483,17 @@ async fn run_projection_supervisor(
                         healthy,
                     );
                     if current && !healthy {
+                        restart_backoff.entry(credential_id.clone()).or_default().failed(std::time::Instant::now());
                         let _ = projection_store.invalidate_stream(&credential_id).await;
+                    }
+                    if current && healthy {
+                        restart_backoff.remove(&credential_id);
                     }
                     let _ = completion.send(current && healthy);
                 }
                 Some(ProjectionMessage::Stopped { credential_id, worker_id }) => {
                     if is_current_worker(&workers, &credential_id, worker_id) {
+                        restart_backoff.entry(credential_id.clone()).or_default().failed(std::time::Instant::now());
                         hot_dispatch.invalidate_credential(&credential_id);
                         let _ = projection_store.invalidate_stream(&credential_id).await;
                         let _ = grid_signal
@@ -445,7 +504,7 @@ async fn run_projection_supervisor(
                     }
                 }
                 None => {
-                    persistence_tasks.abort_all();
+                    persistence_tasks.shutdown().await;
                     return;
                 },
             },
@@ -462,6 +521,7 @@ async fn run_projection_supervisor(
                 let Ok(now) = now_ms() else { continue; };
                 let Ok(active) = projection_store.active_sources(now).await else { continue; };
                 let active_by_id = active.into_iter().map(|source| (source.credential_id.clone(), source)).collect::<BTreeMap<_, _>>();
+                restart_backoff.retain(|id, _| active_by_id.contains_key(id));
                 let stale = workers.keys().filter(|id| !active_by_id.contains_key(*id)).cloned().collect::<Vec<_>>();
                 for id in stale {
                     let in_flight = workers.get(&id).is_some_and(|worker| worker.persistence_in_flight);
@@ -474,6 +534,7 @@ async fn run_projection_supervisor(
                     }
                 }
                 for (credential_id, source) in active_by_id {
+                    if restart_backoff.get(&credential_id).is_some_and(|retry| !retry.ready(std::time::Instant::now())) { continue; }
                     if workers.get(&credential_id).is_some_and(|worker| same_subscription(&worker.source, &source)) { continue; }
                     if workers.get(&credential_id).is_some_and(|worker| worker.persistence_in_flight) {
                         hot_dispatch.invalidate_credential(&credential_id);
@@ -690,6 +751,7 @@ async fn persist_projection_turn(
     projection_store
         .persist(source, snapshot, now_ms)
         .await
+        .map_err(|error| tracing::warn!(credential_id = %source.credential_id, %error, phase = "projection_store", "Account projection persistence failed"))
         .is_ok()
 }
 
@@ -868,8 +930,11 @@ fn spawn_projection_worker(
                     credentials,
                     limits,
                 )
+                .map_err(|error| tracing::warn!(%credential_id, %error, phase = "connect", "Account projection bootstrap failed"))
                 .ok()?;
-            gateway.prime_private_stream().ok()?;
+            gateway.prime_private_stream()
+                .map_err(|error| tracing::warn!(%credential_id, %error, phase = "private_stream", "Account projection bootstrap failed"))
+                .ok()?;
             hot_dispatch.invalidate_credential(&credential_id);
             sender
                 .blocking_send(ProjectionMessage::Invalidate {
@@ -883,6 +948,7 @@ fn spawn_projection_worker(
             // suffix against a projection row that it has not seen yet.
             let initial = gateway
                 .signed_projection_snapshot(fills_cursor.clone())
+                .map_err(|error| tracing::warn!(%credential_id, %error, phase = "signed_baseline", "Account projection bootstrap failed"))
                 .ok()?;
             gateway.install_stream_projection(initial.clone()).ok()?;
             let mut baseline_fill_ids = initial
@@ -901,6 +967,7 @@ fn spawn_projection_worker(
                 })
                 .ok()?;
             if !initial_settled.recv().ok()? {
+                tracing::warn!(%credential_id, phase = "persist_baseline", "Account projection bootstrap failed");
                 return None;
             }
             let mut refresh_at = std::time::Instant::now();
@@ -918,6 +985,16 @@ fn spawn_projection_worker(
                 u64,
             )> = None;
             let mut fill_epoch = 0_u64;
+            let mut balance_dirty = false;
+            let mut balance_read_at = std::time::Instant::now();
+            let mut pending_balance: Option<
+                std::sync::mpsc::Receiver<
+                    Result<
+                        (Vec<venue_execution::SignedAccountBalance>, u64, u64),
+                        venue_gateway_binance::BinanceAccountGatewayError,
+                    >,
+                >,
+            > = None;
             let mut recovering = false;
             let mut recheck_at = std::time::Instant::now() + ACCOUNT_RECHECK_INTERVAL;
             let mut periodic_recheck = false;
@@ -1003,6 +1080,46 @@ fn spawn_projection_worker(
                     PrivatePollAction::RefreshRecommended => (true, false),
                     PrivatePollAction::Idle => (false, false),
                 };
+                balance_dirty |= private_changed;
+                if let Some(result) =
+                    pending_balance
+                        .as_ref()
+                        .and_then(|receiver| match receiver.try_recv() {
+                            Ok(result) => Some(result),
+                            Err(std::sync::mpsc::TryRecvError::Empty) => None,
+                            Err(std::sync::mpsc::TryRecvError::Disconnected) => Some(Err(
+                                venue_gateway_binance::BinanceAccountGatewayError::Readback,
+                            )),
+                        })
+                {
+                    pending_balance = None;
+                    match result {
+                        Ok((balances, observed, generation)) => {
+                            gateway.accept_balance_read(balances, observed, generation)
+                        }
+                        Err(_) => {
+                            balance_dirty = true;
+                            balance_read_at =
+                                std::time::Instant::now() + std::time::Duration::from_secs(5);
+                        }
+                    }
+                }
+                if balance_dirty
+                    && !recovering
+                    && !signed_correction
+                    && pending_balance.is_none()
+                    && std::time::Instant::now() >= balance_read_at
+                {
+                    if let Ok(read) = gateway.prepare_balance_read() {
+                        let (completed, receiver) = std::sync::mpsc::sync_channel(1);
+                        async_runtime.spawn(async move {
+                            let _ = completed.send(read.await);
+                        });
+                        pending_balance = Some(receiver);
+                        balance_dirty = false;
+                    }
+                    balance_read_at = std::time::Instant::now() + std::time::Duration::from_secs(2);
+                }
                 if signed_correction {
                     recovering = true;
                     refresh_at = std::time::Instant::now();
@@ -1166,6 +1283,21 @@ fn now_ms() -> Result<u64, std::io::Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bootstrap_restart_backoff_survives_worker_recreation_and_is_bounded() {
+        let now = std::time::Instant::now();
+        let mut retry = ProjectionRestartBackoff::default();
+        assert!(retry.ready(now));
+        for seconds in [3, 6, 12, 24, 48, 60, 60] {
+            retry.failed(now);
+            let deadline = now + std::time::Duration::from_secs(seconds);
+            assert!(!retry.ready(deadline - std::time::Duration::from_millis(1)));
+            assert!(retry.ready(deadline));
+        }
+        let unrelated = ProjectionRestartBackoff::default();
+        assert!(unrelated.ready(now));
+    }
     use std::{
         collections::{BTreeSet, VecDeque},
         sync::{

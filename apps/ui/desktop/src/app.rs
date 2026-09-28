@@ -1,4 +1,6 @@
 use std::time::Duration;
+#[cfg(not(target_arch = "wasm32"))]
+use std::time::Instant;
 
 use crate::{
     client::{ClientEvent, ControlClient},
@@ -20,7 +22,87 @@ mod market_events;
 mod persistence;
 
 const STORAGE_KEY: &str = "venueflow-state-v1";
-const PERSISTED_SCHEMA_VERSION: u16 = 7;
+const PERSISTED_SCHEMA_VERSION: u16 = 9;
+
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Default)]
+struct FrameTelemetry {
+    started: Option<Instant>,
+    cpu_ms: Vec<f32>,
+    reported_full_window: bool,
+    last_memory_sample: Option<Instant>,
+    source_peak_bytes: usize,
+    chart_cache_peak_bytes: usize,
+    async_reserved_peak_bytes: usize,
+    async_reserved_last_bytes: usize,
+    estimated_indicator_peak_bytes: usize,
+    estimated_indicator_last_bytes: usize,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl FrameTelemetry {
+    fn memory_sample_due(&self) -> bool {
+        !self.reported_full_window
+            && self.last_memory_sample.is_none_or(|last| last.elapsed() >= Duration::from_secs(5))
+    }
+
+    fn record_memory(&mut self, source_bytes: usize, chart_cache_bytes: usize,
+        async_reserved_bytes: usize) {
+        self.last_memory_sample = Some(Instant::now());
+        self.source_peak_bytes = self.source_peak_bytes.max(source_bytes);
+        self.chart_cache_peak_bytes = self.chart_cache_peak_bytes.max(chart_cache_bytes);
+        self.async_reserved_peak_bytes = self.async_reserved_peak_bytes.max(async_reserved_bytes);
+        self.async_reserved_last_bytes = async_reserved_bytes;
+        self.estimated_indicator_last_bytes = source_bytes.saturating_add(chart_cache_bytes)
+            .saturating_add(async_reserved_bytes);
+        self.estimated_indicator_peak_bytes = self.estimated_indicator_peak_bytes
+            .max(self.estimated_indicator_last_bytes);
+    }
+
+    fn record(&mut self, previous_frame_cpu_s: Option<f32>) {
+        if self.reported_full_window {
+            return;
+        }
+        let Some(seconds) = previous_frame_cpu_s.filter(|value| value.is_finite() && *value >= 0.0)
+        else {
+            return;
+        };
+        let started = self.started.get_or_insert_with(Instant::now);
+        self.cpu_ms.push(seconds * 1_000.0);
+        if started.elapsed() >= Duration::from_secs(15 * 60) {
+            self.report("full");
+            self.reported_full_window = true;
+        }
+    }
+
+    fn report(&self, window: &str) {
+        if self.cpu_ms.is_empty() {
+            return;
+        }
+        let mut sorted = self.cpu_ms.clone();
+        sorted.sort_by(f32::total_cmp);
+        let elapsed_s = self.started.map_or(0.0, |started| started.elapsed().as_secs_f64());
+        tracing::info!(target: "venueflow::frame_performance", window,
+            elapsed_s, samples = sorted.len(),
+            p50_ms = percentile(&sorted, 50), p95_ms = percentile(&sorted, 95),
+            p99_ms = percentile(&sorted, 99), max_ms = sorted.last().copied().unwrap_or(0.0),
+            "Visible frame CPU time including UI and rendering, excluding vsync wait");
+        tracing::info!(target: "venueflow::indicator_performance", window,
+            source_peak_bytes = self.source_peak_bytes,
+            chart_cache_peak_bytes = self.chart_cache_peak_bytes,
+            async_reserved_peak_bytes = self.async_reserved_peak_bytes,
+            async_reserved_last_bytes = self.async_reserved_last_bytes,
+            estimated_indicator_peak_bytes = self.estimated_indicator_peak_bytes,
+            estimated_indicator_last_bytes = self.estimated_indicator_last_bytes,
+            "Five-second samples of indicator sources, chart caches and reserved heatmap worker inputs; other UI and renderer allocations excluded");
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn percentile(sorted: &[f32], percent: usize) -> f32 {
+    let rank = sorted.len().saturating_mul(percent).div_ceil(100);
+    sorted[rank.saturating_sub(1).min(sorted.len() - 1)]
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
@@ -59,6 +141,8 @@ pub struct VenueFlowApp {
     settings_state: SettingsPanelState,
     show_symbol_picker: bool,
     reconnect: bool,
+    #[cfg(not(target_arch = "wasm32"))]
+    frame_telemetry: FrameTelemetry,
 }
 
 impl VenueFlowApp {
@@ -121,11 +205,33 @@ impl VenueFlowApp {
             settings_state: SettingsPanelState::default(),
             show_symbol_picker: false,
             reconnect: false,
+            #[cfg(not(target_arch = "wasm32"))]
+            frame_telemetry: FrameTelemetry::default(),
         }
     }
 
     #[cfg(not(target_arch = "wasm32"))]
     fn synchronize_local_markets(&mut self, context: &egui::Context) {
+        let fallback_symbol = self.model.preferences.selected_symbol.clone();
+        let active_charts: Vec<_> = {
+            let tree = self.workspaces.active_tree_mut();
+            tree.tiles
+                .iter()
+                .filter_map(|(id, tile)| match tile {
+                    egui_tiles::Tile::Pane(pane)
+                        if pane.kind == crate::workspace::PaneKind::Chart
+                            && tree.tiles.is_visible(*id) =>
+                    {
+                        Some((pane.symbol.clone().unwrap_or_else(|| fallback_symbol.clone()), pane.interval,
+                            pane.settings_key(), pane.instance))
+                    }
+                    _ => None,
+                })
+                .collect()
+        };
+        let chart_keys = active_charts.iter().map(|(_, _, key, _)| key.clone())
+            .collect::<std::collections::BTreeSet<_>>();
+        self.model.local_markets.retain_chart_keys(&chart_keys);
         if self.market_server != self.model.preferences.market_server {
             self.market_client.take();
             self.market_server = self.model.preferences.market_server;
@@ -149,13 +255,22 @@ impl VenueFlowApp {
             let _ = self.model.local_markets.replace([]);
             return;
         }
-        let selections = self
-            .workspaces
-            .active_chart_requests(&self.model.preferences.selected_symbol)
+        let mut source_demands = std::collections::BTreeMap::new();
+        let selections = active_charts
             .into_iter()
-            .filter_map(|(symbol, interval)| {
+            .filter_map(|(symbol, interval, key, pane_instance)| {
                 match MarketSelection::for_server(self.market_server, &symbol, interval) {
-                    Ok(selection) => Some(selection),
+                    Ok(selection) => {
+                        let settings = self.model.preferences.chart_overrides.get(&key)
+                            .unwrap_or(&self.model.preferences.chart);
+                        let has_anchor = self.model.preferences.analysis_anchors.iter().any(|anchor|
+                            anchor.pane_instance == pane_instance && anchor.binding == selection.binding);
+                        let demand = crate::market_client::SharedSourceDemand::for_chart(settings, has_anchor);
+                        source_demands.entry(selection.binding.clone())
+                            .or_insert_with(crate::market_client::SharedSourceDemand::default)
+                            .merge(demand);
+                        Some(selection)
+                    },
                     Err(error) => {
                         self.model.notice(format!(
                             "Local Binance selection rejected for {symbol}: {error}"
@@ -170,9 +285,18 @@ impl VenueFlowApp {
             Err(error) => {
                 self.model
                     .notice(format!("Local Binance subscription rejected: {error}"));
-                None
+                return;
             }
         };
+        let demanded = source_demands.iter().flat_map(|(binding, demand)|
+            [crate::chart::ChartInterval::OneMinute, crate::chart::ChartInterval::OneDay]
+                .into_iter().filter(move |interval| demand.allows(*interval))
+                .map(move |interval| (binding.clone(), interval)))
+            .collect::<std::collections::BTreeSet<_>>();
+        self.model.local_markets.retain_shared_history_demands(&demanded);
+        if let Some(client) = self.market_client.as_ref() {
+            client.update_source_demands(source_demands);
+        }
         let (Some(generation), Some(client)) = (generation, self.market_client.as_ref()) else {
             return;
         };
@@ -220,6 +344,15 @@ impl VenueFlowApp {
                     .finish_history(&request, Err(error.to_string()));
             }
         }
+        for request in self.model.shared_history_requests.drain(..) {
+            if !client.source_requested(&request) {
+                self.model.local_markets.cancel_shared_history(&request);
+                continue;
+            }
+            if let Err(error) = client.load_shared(request.clone()) {
+                let _ = self.model.local_markets.finish_shared_history(&request, Err(error.to_string()));
+            }
+        }
         // Expired synchronization must mark every old public view stale.
         let market_now = venue_gateway_api::display::received_ms().unwrap_or(u64::MAX);
         self.model
@@ -250,7 +383,9 @@ impl VenueFlowApp {
             };
             match event {
                 ClientEvent::AccountScoped { .. }
+                | ClientEvent::AccountClock(_)
                 | ClientEvent::TerminalAccountProjection { .. }
+                | ClientEvent::TerminalAccountSharedProjection { .. }
                 | ClientEvent::TerminalAccountUnavailable { .. }
                 | ClientEvent::TerminalExecutions(_)
                 | ClientEvent::TerminalExecutionUpdated(_)
@@ -415,7 +550,7 @@ impl VenueFlowApp {
             return;
         };
         let credential_id = scope.credential_id.clone();
-        let symbols = std::iter::once(&self.model.preferences.selected_symbol)
+        let mut symbols = std::iter::once(&self.model.preferences.selected_symbol)
             .chain(self.model.preferences.favorite_symbols.iter())
             .filter_map(|symbol| symbol.parse().ok())
             .fold(Vec::new(), |mut values, symbol| {
@@ -426,6 +561,8 @@ impl VenueFlowApp {
                 }
                 values
             });
+        // The account subscription is a set. Chart focus must not reconnect its SSE.
+        symbols.sort_unstable();
         if symbols.is_empty() {
             return;
         }
@@ -484,6 +621,8 @@ impl eframe::App for VenueFlowApp {
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         #[cfg(not(target_arch = "wasm32"))]
+        self.frame_telemetry.record(_frame.info().cpu_usage);
+        #[cfg(not(target_arch = "wasm32"))]
         crate::latency_evidence::begin_pass(ui.ctx(), self.model.confirmed_account_scope());
         crate::chart_trading::poll(&mut self.model);
         crate::chart_trading::notification(ui.ctx(), &mut self.model);
@@ -511,6 +650,9 @@ impl eframe::App for VenueFlowApp {
         self.synchronize_private_projection();
         #[cfg(not(target_arch = "wasm32"))]
         self.synchronize_local_markets(ui.ctx());
+        self.model
+            .execution
+            .begin_frame(ui.ctx().cumulative_frame_nr());
         let accepts_trading_input = self.workspaces.active == crate::model::WorkspaceKind::Trading
             && !ui.ctx().egui_wants_keyboard_input()
             && !egui::Popup::is_any_open(ui.ctx())
@@ -556,6 +698,15 @@ impl eframe::App for VenueFlowApp {
             };
             tree.ui(&mut behavior, ui);
         });
+        crate::chart_view::evict_inactive_indicator_caches(ui.ctx());
+        #[cfg(not(target_arch = "wasm32"))]
+        if self.frame_telemetry.memory_sample_due() {
+            let source_bytes = self.model.local_markets.retained_study_source_bytes();
+            let chart_cache_bytes = crate::chart_view::retained_indicator_cache_bytes(ui.ctx());
+            let async_reserved_bytes = crate::chart_view::pending_indicator_input_bytes();
+            self.frame_telemetry.record_memory(source_bytes, chart_cache_bytes,
+                async_reserved_bytes);
+        }
         crate::chart_trading::apply_interaction(&mut self.model, &self.client, ui.ctx());
         crate::execution_view::show_position_confirmation(ui, &mut self.model, &self.client, None);
         if std::mem::take(&mut self.model.indicator_settings_requested) {
@@ -639,9 +790,43 @@ impl eframe::App for VenueFlowApp {
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
         theme::BG_PRIMARY.to_normalized_gamma_f32()
     }
+
+    fn on_exit(&mut self) {
+        #[cfg(not(target_arch = "wasm32"))]
+        if !self.frame_telemetry.reported_full_window {
+            self.frame_telemetry.report("partial");
+        }
+    }
 }
 
 fn migrate_persisted_state(mut state: PersistedState) -> PersistedState {
+    if (2..=8).contains(&state.schema_version) {
+        let migrate_order_flow = |chart: &mut crate::chart_settings::ChartDisplaySettings| {
+            chart.session.pdh = false;
+            chart.session.pdl = false;
+            chart.session.sr_current = false;
+            chart.microstructure.show_delta = chart.microstructure.order_flow
+                && !chart.microstructure.cumulative;
+            chart.microstructure.show_cvd = chart.microstructure.order_flow
+                && chart.microstructure.cumulative;
+            chart.microstructure.cvd_reset_mode =
+                venue_indicators::chart::CvdResetMode::LoadedContinuous;
+        };
+        migrate_order_flow(&mut state.preferences.chart);
+        for chart in state.preferences.chart_overrides.values_mut() {
+            migrate_order_flow(chart);
+        }
+    }
+    if (2..=7).contains(&state.schema_version) {
+        // New readout defaults apply only to a fresh install; older saved charts keep their
+        // sparse layout even when serde fills newly introduced fields.
+        state.preferences.chart.atr_value_readout = false;
+        state.preferences.chart.atr_percent_readout = false;
+        for chart in state.preferences.chart_overrides.values_mut() {
+            chart.atr_value_readout = false;
+            chart.atr_percent_readout = false;
+        }
+    }
     // Old installs inherited the development tunnel. Resolve the new startup default
     // before opening the endpoint-scoped vault; never move saved credentials across origins.
     if cfg!(not(target_arch = "wasm32"))
@@ -652,7 +837,7 @@ fn migrate_persisted_state(mut state: PersistedState) -> PersistedState {
     }
     match state.schema_version {
         PERSISTED_SCHEMA_VERSION => state,
-        6 => {
+        6 | 7 | 8 => {
             state.schema_version = PERSISTED_SCHEMA_VERSION;
             state
         }
@@ -678,6 +863,82 @@ fn migrate_persisted_state(mut state: PersistedState) -> PersistedState {
 #[cfg(test)]
 mod tests {
     use super::{PERSISTED_SCHEMA_VERSION, PersistedState, migrate_persisted_state};
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn frame_percentiles_use_nearest_rank() {
+        let samples: Vec<f32> = (1..=20).map(|value| value as f32).collect();
+        assert_eq!(super::percentile(&samples, 50), 10.0);
+        assert_eq!(super::percentile(&samples, 95), 19.0);
+        assert_eq!(super::percentile(&samples, 99), 20.0);
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn sampled_indicator_memory_includes_worker_reservations() {
+        let mut telemetry = super::FrameTelemetry::default();
+        telemetry.record_memory(10, 20, 30);
+        assert_eq!(telemetry.estimated_indicator_last_bytes, 60);
+        assert_eq!(telemetry.estimated_indicator_peak_bytes, 60);
+        assert_eq!(telemetry.async_reserved_peak_bytes, 30);
+        telemetry.record_memory(5, 5, 0);
+        assert_eq!(telemetry.estimated_indicator_last_bytes, 10);
+        assert_eq!(telemetry.estimated_indicator_peak_bytes, 60);
+        assert_eq!(telemetry.async_reserved_last_bytes, 0);
+    }
+
+    #[test]
+    fn old_charts_keep_sparse_readouts_but_new_installs_show_atr_percent() {
+        let mut old = PersistedState { schema_version: 7, ..Default::default() };
+        old.preferences.chart_overrides.insert("chart-1".into(), old.preferences.chart.clone());
+        let migrated = migrate_persisted_state(old);
+        assert!(!migrated.preferences.chart.atr_percent_readout);
+        assert!(!migrated.preferences.chart_overrides["chart-1"].atr_percent_readout);
+        assert!(PersistedState::default().preferences.chart.atr_percent_readout);
+    }
+
+    #[test]
+    fn old_order_flow_choice_migrates_without_enabling_both_panes() {
+        let mut old = PersistedState { schema_version: 8, ..Default::default() };
+        old.preferences.chart.microstructure.order_flow = true;
+        old.preferences.chart.microstructure.cumulative = true;
+        old.preferences.chart.atr_percent_readout = true;
+        let migrated = migrate_persisted_state(old);
+        assert!(!migrated.preferences.chart.microstructure.show_delta);
+        assert!(migrated.preferences.chart.microstructure.show_cvd);
+        assert!(migrated.preferences.chart.atr_percent_readout);
+        assert!(PersistedState::default().preferences.chart.microstructure.heatmap);
+        assert!(!PersistedState::default().preferences.chart.macd.enabled);
+    }
+
+    #[test]
+    fn sparse_saved_chart_json_keeps_explicit_heatmap_and_flow_choices()
+    -> Result<(), serde_json::Error> {
+        let saved = r#"{
+            "schema_version": 7,
+            "preferences": {
+                "chart": {"microstructure": {
+                    "heatmap": false, "order_flow": true, "cumulative": false
+                }},
+                "chart_overrides": {"pane-1": {"microstructure": {
+                    "heatmap": true, "order_flow": true, "cumulative": true
+                }}}
+            }
+        }"#;
+        let migrated = migrate_persisted_state(serde_json::from_str(saved)?);
+        assert_eq!(migrated.schema_version, PERSISTED_SCHEMA_VERSION);
+        assert!(!migrated.preferences.chart.microstructure.heatmap);
+        assert!(migrated.preferences.chart.microstructure.show_delta);
+        assert!(!migrated.preferences.chart.microstructure.show_cvd);
+        assert!(!migrated.preferences.chart.session.pdh);
+        assert!(!migrated.preferences.chart.atr_percent_readout);
+        let pane = &migrated.preferences.chart_overrides["pane-1"];
+        assert!(pane.microstructure.heatmap);
+        assert!(!pane.microstructure.show_delta);
+        assert!(pane.microstructure.show_cvd);
+        assert!(!pane.session.sr_current);
+        Ok(())
+    }
 
     #[test]
     fn legacy_tunnel_default_migrates_once_but_custom_servers_are_preserved() {

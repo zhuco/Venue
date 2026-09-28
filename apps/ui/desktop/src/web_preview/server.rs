@@ -15,7 +15,6 @@ use std::{
     },
     time::Duration,
 };
-use venue_control_protocol::MarketSummary;
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 const ADDRESS: &str = "127.0.0.1:8877";
@@ -132,37 +131,37 @@ impl PublicState {
                 let view = self.store.view(selection)?;
                 let symbol = selection.binding.symbol.to_string();
                 let instrument = self.instruments.get(&symbol);
-                let market =
-                    view.last
-                        .zip(view.bid)
-                        .zip(view.ask)
-                        .and_then(|((last, bid), ask)| {
-                            let quote = self.quotes.get(&symbol)?;
-                            Some(MarketSummary {
-                                symbol: selection.binding.symbol.clone(),
-                                last,
-                                bid,
-                                ask,
-                                change_percent_24h: quote.change_percent_24h,
-                                bars: Vec::new(),
-                                bids: view.bids.clone(),
-                                asks: view.asks.clone(),
-                                trades: view.trades.clone(),
-                                indicators: Vec::new(),
-                            })
-                        });
                 Some(Series {
-                    symbol,
+                    generation: view.generation,
+                    revision: view.revision,
+                    last_price_event_ms: view.last_price_event_ms,
+                    last_price_received_ms: view.last_price_received_ms,
+                    book_event_ms: view.book_event_ms,
+                    book_received_ms: view.book_received_ms,
+                    depth_event_ms: view.depth_event_ms,
+                    depth_received_ms: view.depth_received_ms,
+                    symbol: symbol.clone(),
                     interval: selection.interval,
                     bars: view.bars.clone(),
-                    market,
+                    last: view.last,
+                    bid: view.bid,
+                    ask: view.ask,
+                    bids: view.bids.clone(),
+                    asks: view.asks.clone(),
+                    trades: view.trades.clone(),
+                    change_percent_24h: self
+                        .quotes
+                        .get(&symbol)
+                        .map(|quote| quote.change_percent_24h),
                     status: format!("{:?}", view.status),
+                    price_tick: instrument.and_then(|item| item.price_tick),
                     price_scale: instrument.map_or(8, |item| item.price_scale as usize),
                     quantity_scale: instrument.map_or(8, |item| item.quantity_scale as usize),
                 })
             })
             .collect();
         Ok(Snapshot {
+            captured_at_ms: now,
             selections,
             symbols: self.instruments.keys().cloned().collect(),
             series,

@@ -80,9 +80,67 @@ impl Default for IndicatorStyle {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SessionDisplay {
+    pub sr_current: bool,
+    pub sr_15m: bool,
+    pub sr_1h: bool,
+    pub sr_1d: bool,
+    pub pdh: bool,
+    pub pdl: bool,
+    pub pwh: bool,
+    pub pwl: bool,
+    pub daily_open: bool,
+    pub weekly_open: bool,
+    pub daily_pivot: bool,
+    pub weekly_pivot: bool,
+    pub pivot_r3_s3: bool,
+}
+
+impl Default for SessionDisplay {
+    fn default() -> Self {
+        Self {
+            sr_current: true, sr_15m: false, sr_1h: false, sr_1d: false,
+            pdh: true, pdl: true, pwh: false, pwl: false,
+            daily_open: false, weekly_open: false,
+            daily_pivot: false, weekly_pivot: false, pivot_r3_s3: false,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ProfileDisplay {
+    pub visible_range: bool,
+    pub fixed_range: bool,
+    pub fixed_start_ms: u64,
+    pub fixed_end_ms: u64,
+    pub tick_multiple: u16,
+    pub width_percent: u8,
+    pub opacity_percent: u8,
+    pub poc: bool,
+    pub vah: bool,
+    pub val: bool,
+}
+
+impl Default for ProfileDisplay {
+    fn default() -> Self {
+        Self { visible_range: false, fixed_range: false,
+            fixed_start_ms: 0, fixed_end_ms: 0, tick_multiple: 1,
+            width_percent: 20, opacity_percent: 50,
+            poc: true, vah: true, val: true }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ChartDisplaySettings {
+    pub session: SessionDisplay,
+    pub profile: ProfileDisplay,
+    pub oi_pane: bool,
+    pub custom_library: Option<crate::custom_indicator::CustomLibrary>,
+    pub microstructure: crate::chart_view::microstructure::Settings,
     pub custom_ema_adx: crate::custom_indicator::CustomSettings,
     pub ma_periods: [u32; 3],
     pub ema_periods: [u32; 3],
@@ -132,13 +190,20 @@ pub struct ChartDisplaySettings {
     pub momentum: IndicatorStyle,
     pub emv: IndicatorStyle,
     pub atr: IndicatorStyle,
+    pub atr_value_readout: bool,
+    pub atr_percent_readout: bool,
     pub chart_text_size: u8,
 }
 
 impl Default for ChartDisplaySettings {
     fn default() -> Self {
         Self {
+            session: SessionDisplay::default(),
+            profile: ProfileDisplay::default(),
+            oi_pane: false,
             custom_ema_adx: crate::custom_indicator::CustomSettings::default(),
+            custom_library: None,
+            microstructure: crate::chart_view::microstructure::Settings::default(),
             ma_periods: [7, 25, 99],
             ema_periods: [7, 25, 99],
             wma_periods: [7, 25, 99],
@@ -165,7 +230,7 @@ impl Default for ChartDisplaySettings {
             macd_slow_period: 26,
             macd_signal_period: 9,
             atr_period: 14,
-            ma: IndicatorStyle::new(true, [240, 185, 11], [214, 54, 160])
+            ma: IndicatorStyle::new(false, [240, 185, 11], [214, 54, 160])
                 .with_tertiary([159, 122, 234]),
             ema: IndicatorStyle::new(false, [246, 201, 74], [90, 200, 250])
                 .with_tertiary([214, 54, 160]),
@@ -180,7 +245,7 @@ impl Default for ChartDisplaySettings {
             supertrend: IndicatorStyle::new(false, [14, 203, 129], [246, 70, 93])
                 .with_fill(12, true),
             volume: IndicatorStyle::new(true, [14, 203, 129], [246, 70, 93]),
-            macd: IndicatorStyle::new(true, [240, 185, 11], [235, 47, 166]),
+            macd: IndicatorStyle::new(false, [240, 185, 11], [235, 47, 166]),
             rsi: IndicatorStyle::new(false, [171, 103, 255], [91, 69, 122]),
             mfi: IndicatorStyle::new(false, [91, 159, 255], [91, 159, 255]),
             kdj: IndicatorStyle::new(false, [240, 185, 11], [214, 54, 160])
@@ -194,13 +259,48 @@ impl Default for ChartDisplaySettings {
             momentum: IndicatorStyle::new(false, [91, 159, 255], [91, 159, 255]),
             emv: IndicatorStyle::new(false, [14, 203, 129], [14, 203, 129]),
             atr: IndicatorStyle::new(false, [91, 159, 255], [91, 159, 255]),
+            atr_value_readout: false,
+            atr_percent_readout: true,
             chart_text_size: 11,
         }
     }
 }
 
 impl ChartDisplaySettings {
+    pub fn needs_minute_source(&self, has_anchor: bool) -> bool {
+        self.microstructure.heatmap || self.microstructure.show_delta
+            || self.microstructure.show_cvd || self.profile.visible_range
+            || self.profile.fixed_range || self.session.sr_15m || self.session.sr_1h
+            || has_anchor
+    }
+
+    pub fn needs_day_source(&self) -> bool {
+        let session = &self.session;
+        session.sr_1d || session.pdh || session.pdl || session.pwh || session.pwl
+            || session.daily_open || session.weekly_open || session.daily_pivot
+            || session.weekly_pivot
+    }
+
+    pub fn effective_custom_legacy(&self) -> crate::custom_indicator::CustomSettings {
+        self.custom_library
+            .as_ref()
+            .map_or_else(|| self.custom_ema_adx.clone(), |l| l.legacy())
+    }
     pub fn validate(&self) -> Result<(), &'static str> {
+        self.microstructure.validate()?;
+        if self.profile.tick_multiple == 0 || self.profile.tick_multiple > 1_000
+            || !(10..=35).contains(&self.profile.width_percent)
+            || !(10..=80).contains(&self.profile.opacity_percent)
+            || (self.profile.fixed_range && self.profile.fixed_end_ms != 0
+                && self.profile.fixed_start_ms >= self.profile.fixed_end_ms)
+        {
+            return Err("Profile 桶宽、透明度或固定时间范围无效");
+        }
+        if let Some(library) = &self.custom_library {
+            library
+                .validate()
+                .map_err(|_| "自定义指标列表或源码无效 / Invalid custom indicators")?;
+        }
         self.custom_ema_adx
             .parameters
             .validate()
@@ -292,6 +392,7 @@ impl ChartDisplaySettings {
     #[cfg(not(target_arch = "wasm32"))]
     pub fn engine_config(&self) -> venue_indicators::chart::ChartStudyConfig {
         venue_indicators::chart::ChartStudyConfig {
+            cvd_reset_mode: self.microstructure.cvd_reset_mode,
             sma_period: self.ma_periods[0] as usize,
             sma_second_period: self.ma_periods[1] as usize,
             sma_third_period: self.ma_periods[2] as usize,
@@ -330,10 +431,15 @@ impl ChartDisplaySettings {
             macd_slow_period: self.macd_slow_period as usize,
             macd_signal_period: self.macd_signal_period as usize,
             atr_period: self.atr_period as usize,
+            custom_scripts: self
+                .custom_library
+                .as_ref()
+                .map(|l| l.scripts())
+                .unwrap_or_default(),
             custom_ema_adx: self
-                .custom_ema_adx
+                .effective_custom_legacy()
                 .enabled
-                .then(|| self.custom_ema_adx.parameters.clone()),
+                .then(|| self.effective_custom_legacy().parameters),
         }
     }
 }
@@ -346,7 +452,9 @@ mod tests {
     fn defaults_expose_the_confirmed_commercial_indicator_set() {
         let settings = ChartDisplaySettings::default();
         assert!(settings.validate().is_ok());
-        assert_eq!(settings.enabled_study_count(), 3);
+        assert_eq!(settings.enabled_study_count(), 1);
+        assert!(settings.microstructure.heatmap);
+        assert!(settings.session.pdh && settings.session.pdl);
         assert_eq!(settings.ma_periods, [7, 25, 99]);
     }
 

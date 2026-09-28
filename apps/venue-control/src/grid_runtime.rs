@@ -58,6 +58,7 @@ mod reconcile;
 mod risk;
 #[path = "grid_runtime/stream_overlay.rs"]
 mod stream_overlay;
+mod surface_recovery;
 use fast_path::GridHotPathState;
 pub use fast_path::{GRID_PRIVATE_STREAM_CHANNEL_CAPACITY, GridPrivateStreamSignal};
 
@@ -110,6 +111,7 @@ pub struct BinanceGridRuntime {
     hot_path: GridHotPathState,
     risk_credentials: Option<crate::executor_secret::ExecutorSecretProvider>,
     started_ms: u64,
+    surface_recoveries: BTreeMap<String, surface_recovery::SurfaceRecovery>,
 }
 
 struct GridApplyContext<'a> {
@@ -199,11 +201,21 @@ impl BinanceGridRuntime {
             ),
             risk_credentials: None,
             started_ms: now_ms().unwrap_or(u64::MAX),
+            surface_recoveries: BTreeMap::new(),
         }
     }
 
     pub async fn run_once(&mut self) -> Result<usize, BinanceGridRuntimeError> {
         let records = self.store.list_runtime_instances().await?;
+        self.surface_recoveries.retain(|id, _| {
+            records.iter().any(|r| {
+                &r.instance.instance_id == id
+                    && matches!(
+                        r.instance.state,
+                        GridInstanceState::Running | GridInstanceState::Blocked
+                    )
+            })
+        });
         self.hot_path.replace_records(&records);
         let mut progressed = 0_usize;
         for record in records {
@@ -525,10 +537,35 @@ impl BinanceGridRuntime {
         .map_err(|_| BinanceGridRuntimeError::Planner)?;
 
         if requires_private_surface_retry(&plan.directive) {
-            self.block_if_running(&record, "private_surface_unsettled", now)
+            let unresolved = self
+                .store
+                .has_nonterminal_grid_mutations(&record.instance.instance_id, None)
                 .await?;
-            return Ok(false);
+            let recovery = self
+                .surface_recoveries
+                .entry(record.instance.instance_id.clone())
+                .or_insert_with(|| {
+                    surface_recovery::SurfaceRecovery::new(projection.private_generation, now)
+                });
+            if !recovery.confirmed(
+                projection.private_generation,
+                projection.observed_ms,
+                unresolved,
+            ) {
+                if recovery.request_due(now) {
+                    self.hot_path
+                        .request_recovery(&record.instance.credential_id);
+                    tracing::warn!(instance_id=%record.instance.instance_id, unresolved,
+                        "Grid surface gap awaiting a new signed baseline; reset fenced");
+                }
+                self.block_if_running(&record, "private_surface_unsettled", now)
+                    .await?;
+                return Ok(false);
+            }
+            tracing::info!(instance_id=%record.instance.instance_id,
+                "Grid surface gap confirmed after signed recovery; resetting owned orders");
         }
+        self.surface_recoveries.remove(&record.instance.instance_id);
         match plan.directive {
             GridPlanDirective::Blocked { reason } => {
                 self.block_if_running(&record, blocked_code(reason), now)
@@ -538,8 +575,9 @@ impl BinanceGridRuntime {
             GridPlanDirective::ResetRequired { trigger, .. } => {
                 let updated = self
                     .store
-                    .settle_runtime_state(
+                    .settle_runtime_state_checked(
                         &record.instance.instance_id,
+                        Some(record.instance.revision),
                         record.instance.state,
                         GridInstanceState::ResetRequired,
                         Some(reset_code(trigger)),

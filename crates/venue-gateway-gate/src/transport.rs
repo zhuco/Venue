@@ -121,12 +121,13 @@ impl GateHttpTransport {
         if generation == 0 || endpoint.is_empty() {
             return Err(GateTransportError::Binding);
         }
-        let client = reqwest::Client::builder()
-            .connect_timeout(limits.operation_timeout)
-            .redirect(reqwest::redirect::Policy::none())
-            .no_proxy()
-            .build()
-            .map_err(|_| GateTransportError::Http)?;
+        let client = venue_gateway_api::transport_pool::account_http_client(
+            limits.operation_timeout,
+            None,
+            true,
+            false,
+        )
+        .map_err(|_| GateTransportError::Http)?;
         Ok(Self {
             client,
             binding: binding.gateway_binding().clone(),

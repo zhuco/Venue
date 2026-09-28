@@ -1,8 +1,10 @@
 use eframe::egui::{self, Align2, FontId, RichText, Stroke};
 mod presentation;
 mod status_bar;
+mod tab_prices;
 #[cfg(test)]
 mod tests;
+mod top_bar;
 use egui_tiles::{Behavior, TileId, Tiles, UiResponse};
 use venue_control_protocol::{
     AggressorSide, CommandState, ConnectionState, ControlAction, ControlCommandRequest,
@@ -64,244 +66,7 @@ impl Behavior<Pane> for PaneBehavior<'_> {
     }
 }
 
-pub fn show_top_bar(
-    ui: &mut egui::Ui,
-    model: &mut AppModel,
-    workspaces: &mut Workspaces,
-    show_modules: &mut bool,
-    show_trading_settings: &mut bool,
-    show_execution_account: &mut bool,
-    show_symbol_picker: &mut bool,
-) {
-    egui::Frame::new()
-        .fill(theme::BG_SECONDARY)
-        .stroke(Stroke::new(1.0, theme::DIVIDER))
-        .inner_margin(egui::Margin::symmetric(6, 2))
-        .show(ui, |ui| {
-            let language = model.preferences.language;
-            let mut reset_requested = false;
-            let picker_requested = std::cell::Cell::new(*show_symbol_picker);
-            let mut symbol_filter = model.symbol_filter.clone();
-            let mut market_server = model.preferences.market_server;
-            let mut workspace_selection = workspaces.active;
-            let account_overview = model.account_overview.clone();
-            let mut account_selection_requested = None;
-            let account_label = model
-                .selected_execution_credential()
-                .map(|credential| credential.label.clone())
-                .unwrap_or_else(|| text(language, TextKey::ExecutionAccount).to_owned());
-            let ((), search_response) = egui::containers::Sides::new()
-                .shrink_left()
-                .height(30.0)
-                .show(
-                    ui,
-                    |ui| {
-                        ui.horizontal_centered(|ui| {
-                            ui.label(
-                                RichText::new("VenueFlow")
-                                    .strong()
-                                    .color(theme::TEXT_PRIMARY),
-                            )
-                            .on_hover_text(format!("VenueFlow {}", product_version()));
-                            let drag = ui.allocate_response(
-                                egui::vec2(ui.available_width(), 30.0),
-                                egui::Sense::click_and_drag(),
-                            );
-                            #[cfg(not(target_arch = "wasm32"))]
-                            if drag.double_clicked() {
-                                toggle_maximized(ui.ctx());
-                            } else if drag.drag_started() {
-                                ui.ctx().send_viewport_cmd(egui::ViewportCommand::StartDrag);
-                            }
-                        });
-                    },
-                    |ui| {
-                        ui.horizontal_centered(|ui| {
-                            #[cfg(not(target_arch = "wasm32"))]
-                            window_controls(ui);
-                            if ui.button("设置 / Settings").clicked() {
-                                model.general_settings_requested = true;
-                            }
-                            let user_label = account_overview
-                                .as_ref()
-                                .map(|a| a.user.username.as_str())
-                                .unwrap_or_else(|| text(language, TextKey::LoginAccount));
-                            if ui
-                                .add_enabled(
-                                    !cfg!(all(target_arch = "wasm32", feature = "preview")),
-                                    egui::Button::new(user_label),
-                                )
-                                .clicked()
-                            {
-                                *show_execution_account = true;
-                            }
-                            if let Some(overview) = &account_overview {
-                                egui::ComboBox::from_id_salt("execution-account-selection")
-                                    .width(112.0)
-                                    .selected_text(&account_label)
-                                    .show_ui(ui, |ui| {
-                                        for credential in &overview.credentials {
-                                            let selected =
-                                                overview.selected_credential_id.as_deref()
-                                                    == Some(credential.credential_id.as_str());
-                                            if ui
-                                                .add_enabled(
-                                                    credential.selectable(
-                                                        crate::account_center::now_ms(),
-                                                    ),
-                                                    egui::Button::selectable(
-                                                        selected,
-                                                        format!(
-                                                            "{} · {}",
-                                                            credential.label,
-                                                            credential.masked_key
-                                                        ),
-                                                    ),
-                                                )
-                                                .clicked()
-                                            {
-                                                account_selection_requested =
-                                                    Some(credential.credential_id.clone());
-                                            }
-                                        }
-                                        if ui
-                                            .button(text(language, TextKey::SelectExecutionAccount))
-                                            .clicked()
-                                        {
-                                            *show_execution_account = true;
-                                        }
-                                    });
-                            }
-                            egui::ComboBox::from_id_salt("market-server")
-                                .width(94.0)
-                                .selected_text(format!(
-                                    "{} · {}",
-                                    match language {
-                                        Language::SimplifiedChinese => "行情",
-                                        Language::English => "Market",
-                                    },
-                                    market_server.label()
-                                ))
-                                .show_ui(ui, |ui| {
-                                    for server in crate::model::MarketServer::ALL {
-                                        if cfg!(all(target_arch = "wasm32", feature = "preview"))
-                                            && server != crate::model::MarketServer::Binance
-                                        {
-                                            continue;
-                                        }
-                                        ui.selectable_value(
-                                            &mut market_server,
-                                            server,
-                                            server.label(),
-                                        );
-                                    }
-                                });
-                            let filter_before = symbol_filter.clone();
-                            let search_response = ui.add_sized(
-                                [150.0, 26.0],
-                                egui::TextEdit::singleline(&mut symbol_filter)
-                                    .hint_text(match language {
-                                        Language::SimplifiedChinese => "搜索交易对",
-                                        Language::English => "Search markets",
-                                    })
-                                    .horizontal_align(egui::Align::Min)
-                                    .vertical_align(egui::Align::Center),
-                            );
-                            if search_response.has_focus() || symbol_filter != filter_before {
-                                picker_requested.set(true);
-                            }
-                            search_response
-                        })
-                        .inner
-                    },
-                );
-            ui.separator();
-            egui::containers::Sides::new()
-                .shrink_left()
-                .height(48.0)
-                .show(
-                    ui,
-                    |ui| {
-                        egui::ScrollArea::horizontal()
-                            .id_salt("favorite-symbol-tabs")
-                            .auto_shrink([false, true])
-                            .max_height(48.0)
-                            .min_scrolled_height(48.0)
-                            .scroll_bar_visibility(
-                                egui::scroll_area::ScrollBarVisibility::AlwaysHidden,
-                            )
-                            .show(ui, |ui| {
-                                ui.horizontal_centered(|ui| {
-                                    show_symbol_tabs(ui, model, workspaces, &picker_requested);
-                                });
-                            });
-                    },
-                    |ui| {
-                        egui::ComboBox::from_id_salt("workspace-layout")
-                            .width(116.0)
-                            .selected_text(format!(
-                                "{} · {}",
-                                match language {
-                                    Language::SimplifiedChinese => "布局管理",
-                                    Language::English => "Layout",
-                                },
-                                workspace_selection.label(language)
-                            ))
-                            .show_ui(ui, |ui| {
-                                for workspace in WorkspaceKind::ALL {
-                                    ui.selectable_value(
-                                        &mut workspace_selection,
-                                        workspace,
-                                        workspace.label(language),
-                                    );
-                                }
-                                ui.separator();
-                                if ui.button(text(language, TextKey::ResetLayout)).clicked() {
-                                    reset_requested = true;
-                                    ui.close();
-                                }
-                                if ui
-                                    .button(text(language, TextKey::WorkspaceModules))
-                                    .clicked()
-                                {
-                                    *show_modules = true;
-                                    ui.close();
-                                }
-                            });
-                        if ui
-                            .button(text(language, TextKey::TradingSettings))
-                            .clicked()
-                        {
-                            *show_trading_settings = true;
-                        }
-                    },
-                );
-            workspaces.active = workspace_selection;
-            if model.preferences.market_server != market_server {
-                model.select_market_server(market_server);
-            }
-            if let Some(id) = account_selection_requested {
-                model.begin_account_selection(id);
-            }
-            model.symbol_filter = symbol_filter;
-            *show_symbol_picker = picker_requested.get();
-            if reset_requested {
-                workspaces.restore_active();
-                model.notice("Restored the active workspace layout");
-            }
-            let mut popup_anchor = search_response;
-            let popup_top = ui.min_rect().bottom();
-            popup_anchor.rect = egui::Rect::from_min_max(
-                egui::pos2(popup_anchor.rect.left(), popup_top - 1.0),
-                egui::pos2(popup_anchor.rect.right(), popup_top),
-            );
-            crate::symbol_picker::show(&popup_anchor, show_symbol_picker, model, workspaces);
-        });
-}
-
-fn product_version() -> &'static str {
-    include_str!("../../../../VERSION").trim()
-}
+pub use top_bar::show as show_top_bar;
 
 fn show_symbol_tabs(
     ui: &mut egui::Ui,
@@ -314,22 +79,33 @@ fn show_symbol_tabs(
         tabs.push(model.preferences.selected_symbol.clone());
     }
     let mut close_requested = None;
+    let now = crate::market_prices::now_ms();
+    let cache_id = ui.make_persistent_id("symbol-tab-prices");
+    let mut cache = ui.data_mut(|data| {
+        data.get_temp::<tab_prices::TabPrices>(cache_id)
+            .unwrap_or_default()
+    });
+    cache.retain_tabs(model.preferences.market_server, &tabs);
     for symbol in tabs {
+        #[cfg(not(target_arch = "wasm32"))]
+        let unlisted = !model.local_symbols.is_empty() && !model.local_symbols.contains(&symbol);
+        #[cfg(target_arch = "wasm32")]
+        let unlisted = false;
         let quote = local_quote(model, &symbol);
-        let details = quote.map_or_else(
-            || "—  —".to_owned(),
-            |quote| {
-                format!(
-                    "{}{} {:+.2}%",
-                    if model.preferences.market_server == crate::model::MarketServer::Hyperliquid {
-                        "Mark "
-                    } else {
-                        ""
-                    },
-                    model.format_market_price(&symbol, quote.last),
-                    quote.change_percent_24h
-                )
-            },
+        let latest = cache.observe(&symbol, model.last_trade_for_tab(&symbol, now));
+        let details = format!(
+            "{} {}",
+            latest
+                .map(|price| model.format_market_price(&symbol, price.value))
+                .unwrap_or_else(|| match model.preferences.language {
+                    Language::SimplifiedChinese if unlisted => "该所无此合约".into(),
+                    Language::English if unlisted => "Not listed".into(),
+                    Language::SimplifiedChinese => "读取中".into(),
+                    Language::English => "Loading".into(),
+                }),
+            quote
+                .map(|quote| format!("{:+.2}%", quote.change_percent_24h))
+                .unwrap_or_else(|| "—".into()),
         );
         let selected = model.preferences.selected_symbol == symbol;
         let detail_color = quote.map_or(theme::TEXT_SECONDARY, |quote| {
@@ -337,6 +113,15 @@ fn show_symbol_tabs(
         });
         let (rect, response) =
             ui.allocate_exact_size(egui::vec2(152.0, 48.0), egui::Sense::click());
+        let response = if let Some(price) = latest {
+            let age = now.saturating_sub(price.event_ms) / 1000;
+            response.on_hover_text(match model.preferences.language {
+                Language::SimplifiedChinese => format!("最近市场成交价 · {age} 秒前更新"),
+                Language::English => format!("Last market trade · updated {age}s ago"),
+            })
+        } else {
+            response
+        };
         ui.painter().rect_filled(
             rect,
             0.0,
@@ -405,6 +190,7 @@ fn show_symbol_tabs(
             workspaces.follow_dynamic_charts_latest();
         }
     }
+    ui.data_mut(|data| data.insert_temp(cache_id, cache));
     if let Some(symbol) = close_requested
         && model.close_symbol_tab(&symbol)
     {
@@ -553,29 +339,36 @@ fn show_market_watch(ui: &mut egui::Ui, model: &mut AppModel) {
                     #[cfg(not(target_arch = "wasm32"))]
                     {
                         if let Some(last) = model
-                            .local_markets
-                            .view_for_symbol(&symbol)
-                            .and_then(|market| market.last)
+                            .market_prices(&symbol, crate::market_prices::now_ms())
+                            .reference_price()
                         {
                             ui.monospace(model.format_market_price(&symbol, last));
-                            ui.colored_label(theme::BUY, "BINANCE");
+                            ui.colored_label(theme::BUY, model.preferences.market_server.label());
                         } else if let Some(projected) = market(model, &symbol) {
                             ui.monospace(model.format_market_price(&symbol, projected.last));
                             ui.colored_label(theme::TEXT_SECONDARY, "CONTROL");
                         } else {
                             ui.monospace("—");
-                            ui.colored_label(theme::TEXT_SECONDARY, "BINANCE");
+                            ui.colored_label(
+                                theme::TEXT_SECONDARY,
+                                model.preferences.market_server.label(),
+                            );
                         }
                     }
                     #[cfg(target_arch = "wasm32")]
                     {
-                        if let Some(projected) = market(model, &symbol) {
-                            ui.monospace(model.format_market_price(&symbol, projected.last));
-                            ui.colored_label(theme::TEXT_SECONDARY, "CONTROL");
+                        if let Some(last) = model
+                            .market_prices(&symbol, crate::market_prices::now_ms())
+                            .reference_price()
+                        {
+                            ui.monospace(model.format_market_price(&symbol, last));
                         } else {
                             ui.monospace("—");
-                            ui.colored_label(theme::TEXT_SECONDARY, "CONTROL");
                         }
+                        ui.colored_label(
+                            theme::TEXT_SECONDARY,
+                            model.preferences.market_server.label(),
+                        );
                     }
                     ui.end_row();
                 }
@@ -590,7 +383,7 @@ fn show_chart(ui: &mut egui::Ui, pane: &mut Pane, model: &mut AppModel, client: 
         model.indicator_settings_requested = true;
         model.indicator_target = Some(settings_key.clone());
     }
-    let settings = model
+    let mut settings = model
         .preferences
         .chart_overrides
         .get(&settings_key)
@@ -617,6 +410,9 @@ fn show_chart(ui: &mut egui::Ui, pane: &mut Pane, model: &mut AppModel, client: 
     }
     let overlays = crate::chart_trading::collect(model, &symbol, &pane.trading_display);
     #[cfg(not(target_arch = "wasm32"))]
+    pane.analysis.select(MarketSelection::for_server(
+        model.preferences.market_server, &symbol, pane.interval).ok());
+    #[cfg(not(target_arch = "wasm32"))]
     if let Ok(selection) =
         MarketSelection::for_server(model.preferences.market_server, &symbol, pane.interval)
         && let Err(error) =
@@ -629,6 +425,75 @@ fn show_chart(ui: &mut egui::Ui, pane: &mut Pane, model: &mut AppModel, client: 
     }
     #[cfg(not(target_arch = "wasm32"))]
     if let Some(local) = model.local_markets.chart_view(&settings_key) {
+        ui.horizontal_wrapped(|ui| {
+            ui.weak(format!("{} · {}", model.preferences.market_server.label(), local.selection.binding.symbol));
+            let now = crate::market_prices::now_ms();
+            if let Some(funding) = local.funding.as_ref() {
+                let (label, tooltip) = presentation::funding_display(funding, now, language);
+                ui.label(label).on_hover_text(tooltip);
+            } else {
+                ui.weak(if language == Language::SimplifiedChinese { "Funding — · 等待来源" } else { "Funding — · waiting for source" });
+            }
+            if let Some(interest) = local.open_interest_current.as_ref() {
+                let (label, tooltip) = presentation::open_interest_display(interest, now, language);
+                ui.label(label).on_hover_text(tooltip);
+            } else {
+                let reason = local.open_interest_error.as_deref().unwrap_or("loading");
+                ui.weak(format!("OI — · {reason}"));
+            }
+            let locally_sampled = local.open_interest_history.last().is_some_and(|sample|
+                sample.time_source == venue_domain::MarketTimeSource::LocalObservation);
+            if locally_sampled {
+                ui.weak("OI · 本地5m采样").on_hover_text(
+                    "公开快照由本机开始记录；历史不可回补，时间为本机收到快照的时刻，变化幅度仅作估算");
+            }
+            let history_stale = presentation::open_interest_history_stale(
+                local.open_interest_history.last(), now);
+            if history_stale {
+                ui.colored_label(theme::WARNING, "OI history stale").on_hover_text(
+                    local.open_interest_history_error.as_deref().unwrap_or(
+                        "Last verified 5m OI sample is over 15 minutes old"));
+            }
+            let changes = if history_stale { [None; 5] } else {
+                venue_indicators::chart::open_interest::changes(&local.open_interest_history)
+            };
+            if let Some(state) = (!locally_sampled).then_some(changes[0]).flatten()
+                .and_then(|change| model.local_markets.base_minute_facts(&local.selection.binding)
+                .and_then(|minutes| venue_indicators::chart::open_interest::price_oi_state(change, minutes))) {
+                use venue_indicators::chart::open_interest::PriceOiState;
+                let label = match state {
+                    PriceOiState::PriceUpOiUp => "Price↑ OI↑",
+                    PriceOiState::PriceUpOiDown => "Price↑ OI↓",
+                    PriceOiState::PriceDownOiUp => "Price↓ OI↑",
+                    PriceOiState::PriceDownOiDown => "Price↓ OI↓",
+                };
+                ui.weak(format!("{label} · 5m"))
+                    .on_hover_text("Price and OI compare the same completed 5m interval; descriptive only");
+            }
+            for (label, change) in ["5m", "15m", "1h", "4h", "24h"].into_iter().zip(changes) {
+                let label = if locally_sampled { format!("{label}本地") } else { label.to_owned() };
+                if let Some(change) = change {
+                    ui.weak(format!("{label} {}%", format_decimal(change.change_percent, 2)))
+                        .on_hover_text(format!("{} OI samples: {} → {} ms UTC",
+                            if locally_sampled { "Locally observed, approximate" } else { "Exchange" },
+                            change.baseline_time_ms, change.latest_time_ms));
+                } else {
+                    ui.weak(format!("{label} —")).on_hover_text(
+                        if local.open_interest_history.is_empty() {
+                            local.open_interest_history_error.as_deref().unwrap_or(
+                                "No verified 5m OI history for this selected market; current OI is not backfilled")
+                        } else if history_stale {
+                            "Last verified 5m OI sample is over 15 minutes old"
+                        } else {
+                            "Insufficient completed OI samples for this comparison window"
+                        });
+                }
+            }
+            if let Some(error) = &local.study_error {
+                ui.colored_label(theme::WARNING, "Indicator —")
+                    .on_hover_text(error);
+            }
+        });
         if local.bars.is_empty() {
             if let Some(bars) = model.local_markets.chart_preview(&local.selection) {
                 let rect = ui.available_rect_before_wrap();
@@ -641,12 +506,22 @@ fn show_chart(ui: &mut egui::Ui, pane: &mut Pane, model: &mut AppModel, client: 
                         language,
                         &settings,
                         model.market_scales(&symbol),
+                        model.market_price_tick(&symbol),
                         pane.interval,
                         None,
                         None,
                         &pane.trading_display,
                         &[],
                         (None, None),
+                        None,
+                        Some(&local.selection.binding),
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
                     );
                 });
                 crate::chart_view::loading::preview_badge(ui, rect, language);
@@ -670,30 +545,78 @@ fn show_chart(ui: &mut egui::Ui, pane: &mut Pane, model: &mut AppModel, client: 
             }
             return;
         }
+        use crate::chart_view::analysis::{AnalysisAction, AnalysisMode, AvwapAnchor, FixedProfileRange};
+        let binding = local.selection.binding.clone();
+        let anchors = model.preferences.analysis_anchors.iter()
+            .filter(|anchor| anchor.pane_instance == pane.instance && anchor.binding == binding)
+            .cloned().collect::<Vec<_>>();
+        let fixed = model.preferences.fixed_profile_ranges.iter()
+            .find(|range| range.pane_instance == pane.instance && range.binding == binding).cloned();
+        settings.profile.fixed_start_ms = fixed.as_ref().map_or(0, |range| range.start_ms);
+        settings.profile.fixed_end_ms = fixed.as_ref().map_or(0, |range| range.end_ms);
+        ui.horizontal_wrapped(|ui| {
+            if settings.microstructure.heatmap {
+                let active = pane.heatmap_history_scope.as_ref() == Some(&local.selection);
+                let title = if active {
+                    if language == Language::SimplifiedChinese { "停止历史热图" } else { "Stop history heatmap" }
+                } else if language == Language::SimplifiedChinese {
+                    "加载可见热图历史"
+                } else { "Load visible heatmap history" };
+                if ui.small_button(title).on_hover_text(if language == Language::SimplifiedChinese {
+                    "按当前交易所、交易对和可见时间范围逐页补齐同源1m K线；公开数据缓存在本机"
+                } else {
+                    "Page same-market 1m candles for this visible range; public history is cached locally"
+                }).clicked() {
+                    pane.heatmap_history_scope = if active { None } else { Some(local.selection.clone()) };
+                }
+            }
+            if ui.add_enabled(anchors.len() < 8, egui::Button::new("＋ AVWAP")).clicked() {
+                pane.analysis.mode = AnalysisMode::AddAnchor;
+            }
+            for anchor in &anchors {
+                if ui.small_button(format!("A{} ↔", anchor.id)).on_hover_text("Click or drag to the target candle").clicked() {
+                    pane.analysis.mode = AnalysisMode::MoveAnchor(anchor.id);
+                }
+                if ui.small_button(format!("A{} ×", anchor.id)).on_hover_text("Delete anchor").clicked() {
+                    model.preferences.analysis_anchors.retain(|item| item.id != anchor.id);
+                }
+            }
+            if !anchors.is_empty() && ui.small_button(if language == Language::SimplifiedChinese {
+                "清空本图 AVWAP"
+            } else { "Clear chart AVWAP" }).clicked() {
+                model.preferences.analysis_anchors.retain(|item|
+                    item.pane_instance != pane.instance || item.binding != binding);
+                pane.analysis.mode = AnalysisMode::None;
+            }
+            if ui.small_button("Select Profile").clicked() { pane.analysis.mode = AnalysisMode::FixedStart; }
+            if let Some(range) = &fixed {
+                if ui.small_button("FR start").clicked() { pane.analysis.mode = AnalysisMode::MoveFixedStart(range.end_ms); }
+                if ui.small_button("FR end").clicked() { pane.analysis.mode = AnalysisMode::MoveFixedEnd(range.start_ms); }
+                if ui.small_button("FR ×").clicked() {
+                    model.preferences.fixed_profile_ranges.retain(|item| item.pane_instance != pane.instance || item.binding != binding);
+                }
+            }
+            if pane.analysis.mode != AnalysisMode::None {
+                ui.colored_label(theme::WARNING, "Click candle · Esc cancels");
+            }
+        });
         let (price_scale, quantity_scale) = model.market_scales(&symbol);
-        let chart = presentation::sample(
+        let prices = model.market_prices(&symbol, crate::market_prices::now_ms());
+        let chart = presentation::sample_revision(
             ui,
             ("chart-display", pane.instance),
-            (
-                local.selection.clone(),
-                local.generation,
-                local.status,
-                local.bars.len(),
-                local.bars.first().map(|bar| bar.open_time_ms),
-                settings.clone(),
-            ),
+            (local.selection.clone(), local.generation, settings.clone()),
+            Some((local.revision, prices)),
             model.preferences.trading.chart_cadence,
             || {
                 (
                     local.bars.clone(),
                     local.studies.clone(),
-                    local.last,
-                    local.bid,
-                    local.ask,
-                    (local.status == crate::market::MarketStatus::Live)
-                        .then_some(local.last_price_event_ms)
-                        .flatten(),
-                    local.last_price_received_ms,
+                    prices.reference_price(),
+                    prices.bid,
+                    prices.ask,
+                    prices.reference().map(|price| price.event_ms),
+                    prices.reference().map(|price| price.received_ms),
                 )
             },
         );
@@ -717,13 +640,59 @@ fn show_chart(ui: &mut egui::Ui, pane: &mut Pane, model: &mut AppModel, client: 
             language,
             &settings,
             (price_scale, quantity_scale),
+            model.market_price_tick(&symbol),
             pane.interval,
             chart.2,
             highlighted_price,
             &pane.trading_display,
             &overlays,
             (chart.3, chart.4),
+            model
+                .market_depth(&symbol, crate::market_prices::now_ms())
+                .map(|book| (book.bids.as_slice(), book.asks.as_slice())),
+            Some(&local.selection.binding),
+            model.local_markets.base_minutes(&local.selection.binding),
+            model.local_markets.session_days(&local.selection.binding),
+            model.local_markets.base_minute_facts(&local.selection.binding),
+            model.local_markets.base_minute_forming_fact(&local.selection.binding),
+            Some((&anchors, &mut pane.analysis)),
+            Some(local.bar_revision),
+            Some(&local.open_interest_history),
         );
+        if let Some(action) = pane.analysis.action.take() {
+            match action {
+                AnalysisAction::AddAnchor { time_ms, price } => {
+                    if anchors.len() < 8 {
+                        let id = model.preferences.analysis_anchors.iter().map(|item| item.id).max()
+                            .unwrap_or(0).saturating_add(1);
+                        let palette = [[240, 185, 11], [90, 200, 250], [159, 122, 234],
+                            [14, 203, 129], [246, 70, 93], [253, 138, 0], [183, 138, 247], [91, 159, 255]];
+                        model.preferences.analysis_anchors.push(AvwapAnchor { id, pane_instance: pane.instance,
+                            binding: binding.clone(), open_time_ms: time_ms, reference_price: price,
+                            color: palette[anchors.len()] });
+                    }
+                }
+                AnalysisAction::MoveAnchor { id, time_ms, price } => {
+                    if let Some(anchor) = model.preferences.analysis_anchors.iter_mut()
+                        .find(|anchor| anchor.id == id && anchor.pane_instance == pane.instance && anchor.binding == binding) {
+                        anchor.open_time_ms = time_ms;
+                        anchor.reference_price = price;
+                    }
+                }
+                AnalysisAction::SetFixedRange { start_ms, end_ms } => {
+                    model.preferences.fixed_profile_ranges.retain(|item| item.pane_instance != pane.instance || item.binding != binding);
+                    model.preferences.fixed_profile_ranges.push(FixedProfileRange {
+                        pane_instance: pane.instance, binding: binding.clone(), start_ms, end_ms,
+                    });
+                    let saved = model.preferences.chart_overrides.entry(settings_key.clone())
+                        .or_insert_with(|| settings.clone());
+                    saved.profile.fixed_range = true;
+                    saved.profile.fixed_start_ms = 0;
+                    saved.profile.fixed_end_ms = 0;
+                }
+            }
+            ui.ctx().request_repaint();
+        }
         crate::latency_evidence::clear_market();
         let render_key = egui::Id::new(("chart-history-rendered", pane.instance));
         let rendered = (local.selection.clone(), local.generation);
@@ -738,8 +707,56 @@ fn show_chart(ui: &mut egui::Ui, pane: &mut Pane, model: &mut AppModel, client: 
                 .data_mut(|data| data.insert_temp(render_key, rendered));
         }
         let selection = local.selection.clone();
-        let near_start = pane.viewport.right_offset() > 0
-            && pane.viewport.right_offset() + pane.viewport.visible_bars() + 32 >= chart.0.len();
+        {
+            let visible = pane.viewport.visible_range(chart.0.len());
+            if let Some(first) = chart.0.get(visible.start) {
+                let mut minute_start = first.open_time_ms;
+                if settings.microstructure.heatmap {
+                    minute_start = minute_start.saturating_sub(u64::from(settings.microstructure.lookback_hours) * 3_600_000);
+                }
+                if settings.session.sr_1h {
+                    minute_start = minute_start.saturating_sub(72 * 3_600_000);
+                } else if settings.session.sr_15m {
+                    minute_start = minute_start.saturating_sub(24 * 3_600_000);
+                }
+                if settings.microstructure.show_cvd
+                    && settings.microstructure.cvd_reset_mode == venue_indicators::chart::CvdResetMode::UtcDaily {
+                    minute_start = minute_start.min(first.open_time_ms / 86_400_000 * 86_400_000);
+                }
+                if settings.profile.fixed_range && let Some(range) = &fixed {
+                    minute_start = minute_start.min(range.start_ms);
+                }
+                if !anchors.is_empty() { minute_start = minute_start.min(anchors.iter().map(|anchor| anchor.open_time_ms).min().unwrap_or(minute_start)); }
+                if pane.viewport.right_offset() == 0
+                    && !(settings.microstructure.heatmap
+                        && pane.heatmap_history_scope.as_ref() == Some(&selection)) {
+                    // The default view warms only a small 1m window. Older model coverage
+                    // is requested when the user navigates history; absent coverage stays visible.
+                    minute_start = minute_start.max(crate::account_center::now_ms().saturating_sub(6 * 3_600_000));
+                }
+                let visible_end_ms = chart.0.get(visible.end.saturating_sub(1))
+                    .map_or(first.open_time_ms, |bar| bar.open_time_ms
+                        .saturating_add(selection.interval.duration_ms().saturating_sub(1)));
+                if settings.needs_minute_source(!anchors.is_empty()) {
+                    if let Some(request) = model.local_markets.begin_shared_history(&binding,
+                        crate::chart::ChartInterval::OneMinute, minute_start, visible_end_ms) {
+                        model.shared_history_requests.push(request);
+                    }
+                }
+                if settings.needs_day_source() {
+                    let week = venue_indicators::chart::session_levels::session_start(first.open_time_ms,
+                        venue_indicators::chart::session_levels::SessionPeriod::Weekly).unwrap_or(first.open_time_ms);
+                    let day_start = week.saturating_sub(7 * 86_400_000);
+                    if let Some(request) = model.local_markets.begin_shared_history(&binding,
+                        crate::chart::ChartInterval::OneDay, day_start, visible_end_ms) {
+                        model.shared_history_requests.push(request);
+                    }
+                }
+            }
+        }
+        let near_start = pane.viewport.visible_bars() > chart.0.len()
+            || (pane.viewport.right_offset() > 0
+                && pane.viewport.right_offset() + pane.viewport.visible_bars() + 32 >= chart.0.len());
         let manual = std::mem::take(&mut pane.history_requested);
         if (manual || near_start)
             && let Some(request) = model.local_markets.begin_history(&selection, manual)
@@ -774,21 +791,39 @@ fn show_chart(ui: &mut egui::Ui, pane: &mut Pane, model: &mut AppModel, client: 
                 &symbol,
                 &format!("Binance · {} · read only", series.status),
             );
-            let market = series.market.as_ref();
+            let prices = model.market_prices(&symbol, crate::market_prices::now_ms());
+            let chart = presentation::sample_revision(
+                ui,
+                ("preview-chart", pane.instance),
+                (symbol.clone(), pane.interval, series.generation),
+                Some((series.revision, prices)),
+                model.preferences.trading.chart_cadence,
+                || (series.bars.clone(), prices),
+            );
             let _ = crate::chart_view::candle_plot(
                 ui,
-                &series.bars,
+                &chart.0,
                 &[],
                 &mut pane.viewport,
                 language,
                 &settings,
                 (series.price_scale, series.quantity_scale),
+                model.market_price_tick(&symbol),
                 pane.interval,
-                market.map(|value| value.last),
+                chart.1.reference_price(),
                 None,
                 &pane.trading_display,
                 &overlays,
-                (market.map(|value| value.bid), market.map(|value| value.ask)),
+                (chart.1.bid, chart.1.ask),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
             );
         } else {
             empty(ui, &model.browser_market.status);
@@ -845,12 +880,22 @@ fn show_chart(ui: &mut egui::Ui, pane: &mut Pane, model: &mut AppModel, client: 
         language,
         &settings,
         (8, 8),
+        model.market_price_tick(&symbol),
         pane.interval,
         Some(chart.1),
         highlighted_price,
         &pane.trading_display,
         &overlays,
         (Some(chart.2), Some(chart.3)),
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
     );
     if let Some(price) = selected_price {
         model.select_trading_price(&symbol, price, ui.ctx());
@@ -884,6 +929,13 @@ fn show_chart_toolbar(ui: &mut egui::Ui, pane: &mut Pane, language: Language) ->
         if ui.small_button(text(language, TextKey::Fit)).clicked() {
             pane.viewport.reset();
         }
+        if ui.small_button(if language == Language::SimplifiedChinese {
+            "更早K线"
+        } else {
+            "Older candles"
+        }).clicked() {
+            pane.history_requested = true;
+        }
     });
     settings_requested
 }
@@ -897,26 +949,33 @@ fn show_order_book(ui: &mut egui::Ui, pane: &Pane, model: &mut AppModel) {
         .to_owned();
     #[cfg(not(target_arch = "wasm32"))]
     if let Some(local) = model.local_markets.view_for_symbol(&symbol) {
-        let scope = (local.selection.clone(), local.generation, local.status);
-        let book = presentation::sample(
+        let scope = (local.selection.clone(), local.generation);
+        let prices = model.market_prices(&symbol, crate::market_prices::now_ms());
+        let depth = model.market_depth(&symbol, crate::market_prices::now_ms());
+        let book = presentation::sample_revision(
             ui,
             ("book-display", pane.instance),
             scope.clone(),
+            Some((
+                prices,
+                depth.map(|view| (view.selection.clone(), view.generation, view.revision)),
+            )),
             model.preferences.trading.book_cadence,
             || {
                 (
-                    local.asks.clone(),
-                    local.bids.clone(),
-                    local.last,
-                    local.bid,
-                    local.ask,
+                    depth.map_or_else(Vec::new, |view| view.asks.clone()),
+                    depth.map_or_else(Vec::new, |view| view.bids.clone()),
+                    prices.reference_price(),
+                    prices.bid,
+                    prices.ask,
                 )
             },
         );
-        let trades = presentation::sample(
+        let trades = presentation::sample_revision(
             ui,
             ("tape-display", pane.instance),
             scope,
+            Some(local.revision),
             model.preferences.trading.tape_cadence,
             || local.trades.clone(),
         );
@@ -935,6 +994,59 @@ fn show_order_book(ui: &mut egui::Ui, pane: &Pane, model: &mut AppModel) {
         );
         if let Some(price) = selected_price {
             model.select_trading_price(&symbol, price, ui.ctx());
+        }
+        return;
+    }
+    #[cfg(all(target_arch = "wasm32", feature = "preview"))]
+    {
+        if let Some(series) = model.browser_market.series(&symbol, None) {
+            let public_now = model
+                .browser_market
+                .public_now_ms(crate::account_center::now_ms());
+            let prices = model.market_prices(&symbol, crate::market_prices::now_ms());
+            let depth = model.browser_market.depth_series(&symbol, public_now);
+            let tape = model.browser_market.tape_series(&symbol);
+            let scope = (symbol.clone(), series.generation);
+            let book = presentation::sample_revision(
+                ui,
+                ("preview-book", pane.instance),
+                scope.clone(),
+                Some((
+                    prices,
+                    depth.map(|view| (view.interval, view.generation, view.revision)),
+                )),
+                model.preferences.trading.book_cadence,
+                || {
+                    (
+                        depth.map_or_else(Vec::new, |view| view.asks.clone()),
+                        depth.map_or_else(Vec::new, |view| view.bids.clone()),
+                        prices,
+                    )
+                },
+            );
+            let trades = presentation::sample_revision(
+                ui,
+                ("preview-tape", pane.instance),
+                scope,
+                Some(tape.map(|view| (view.interval, view.generation, view.revision))),
+                model.preferences.trading.tape_cadence,
+                || tape.map_or_else(Vec::new, |view| view.trades.clone()),
+            );
+            let _ = crate::order_book_view::show(
+                ui,
+                pane.instance,
+                &book.0,
+                &book.1,
+                &trades,
+                book.2.reference_price(),
+                book.2.bid,
+                book.2.ask,
+                language,
+                model,
+                &symbol,
+            );
+        } else {
+            empty(ui, text(language, TextKey::NoBook));
         }
         return;
     }
@@ -990,10 +1102,11 @@ fn show_trade_tape(ui: &mut egui::Ui, pane: &Pane, model: &AppModel) {
     pane_heading(ui, text(language, TextKey::TradeTape), symbol);
     #[cfg(not(target_arch = "wasm32"))]
     if let Some(local) = model.local_markets.view_for_symbol(symbol) {
-        let trades = presentation::sample(
+        let trades = presentation::sample_revision(
             ui,
             ("standalone-tape", pane.instance),
-            (local.selection.clone(), local.generation, local.status),
+            (local.selection.clone(), local.generation),
+            Some(local.revision),
             model.preferences.trading.tape_cadence,
             || local.trades.clone(),
         );
@@ -1001,6 +1114,23 @@ fn show_trade_tape(ui: &mut egui::Ui, pane: &Pane, model: &AppModel) {
             empty(ui, text(language, TextKey::NoTrades));
         } else {
             show_trade_rows(ui, pane.instance, &trades, language, model, symbol);
+        }
+        return;
+    }
+    #[cfg(all(target_arch = "wasm32", feature = "preview"))]
+    {
+        if let Some(series) = model.browser_market.tape_series(symbol) {
+            let trades = presentation::sample_revision(
+                ui,
+                ("standalone-preview-tape", pane.instance),
+                (symbol.to_owned(), series.generation),
+                Some((series.interval, series.revision)),
+                model.preferences.trading.tape_cadence,
+                || series.trades.clone(),
+            );
+            show_trade_rows(ui, pane.instance, &trades, language, model, symbol);
+        } else {
+            empty(ui, text(language, TextKey::NoTrades));
         }
         return;
     }
@@ -1580,9 +1710,7 @@ fn format_freshness(age_ms: Option<u64>) -> String {
 }
 fn market<'a>(model: &'a AppModel, symbol: &str) -> Option<&'a MarketSummary> {
     #[cfg(all(target_arch = "wasm32", feature = "preview"))]
-    if let Some(series) = model.browser_market.series(symbol, None) {
-        return series.market.as_ref();
-    }
+    return None;
     #[cfg(not(target_arch = "wasm32"))]
     if model.market_generation > 0 || model.market_worker_failed {
         return None;

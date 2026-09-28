@@ -12,7 +12,7 @@ use crate::protocol::account::{
 };
 use rust_decimal::Decimal;
 use sha3::{Digest, Keccak256};
-use tokio::runtime::{Builder, Runtime};
+use tokio::runtime::Runtime;
 use venue_domain::domain::{
     Asset, ExecutionCommand, FieldState, InstrumentIdentity, LimitTimeInForce, MarketKind,
     MarketReduceCommand, NativeOrderFamily, OrderCommand, OrderSide, OrderState, Position,
@@ -67,7 +67,7 @@ const MAX_RISK_RATE_AGE_MS: u64 = 60_000;
 /// Production Hyperliquid adapter for the lightweight account host. The only mutation method is
 /// the host trait's linear-permit consumer; raw signing and `/exchange` POST remain crate-private.
 pub struct HyperliquidAccountGateway {
-    runtime: Runtime,
+    runtime: &'static Runtime,
     binding: HyperliquidReadBinding,
     credentials: HyperliquidCredentials,
     transport: HyperliquidHttpTransport,
@@ -144,10 +144,7 @@ impl HyperliquidAccountGateway {
     ) -> Result<Self, HyperliquidAccountGatewayError> {
         let transport = HyperliquidHttpTransport::new(operation_timeout, max_body_bytes)
             .map_err(HyperliquidAccountGatewayError::Transport)?;
-        let runtime = Builder::new_current_thread()
-            .enable_io()
-            .enable_time()
-            .build()
+        let runtime = venue_gateway_api::transport_pool::account_runtime()
             .map_err(|_| HyperliquidAccountGatewayError::Runtime)?;
         let meta = runtime.block_on(fetch_meta(&read_binding, &transport))?;
         let account_safety = runtime.block_on(refresh_account(&meta, &transport))?;

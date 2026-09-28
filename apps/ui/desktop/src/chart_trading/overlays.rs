@@ -2,7 +2,6 @@ use eframe::egui::{self, Align2, Color32, FontId, Pos2, Rect, Stroke};
 use rust_decimal::Decimal;
 use venue_control_protocol::UiBar;
 use venue_domain::{OrderSide, PositionSide};
-mod fills;
 
 use super::{ChartTradingSettings, label};
 use crate::{
@@ -91,20 +90,13 @@ pub(crate) fn collect(
                 }
                 result.push(ChartOverlay {
                     price,
-                    label: format!(
-                        "{} · {}",
-                        order_intent(
-                            language,
-                            order.order_side,
-                            order.position_side,
-                            order.reduce_only
-                        ),
-                        if order.post_only {
-                            label(language, "只做Maker", "Maker only")
-                        } else {
-                            label(language, "限价委托", "Limit order")
-                        }
-                    ),
+                    label: order_intent(
+                        language,
+                        order.order_side,
+                        order.position_side,
+                        order.reduce_only,
+                    )
+                    .into(),
                     color: side_color(order.order_side),
                     time_ms: None,
                     line: settings.order_lines,
@@ -159,20 +151,22 @@ pub(crate) fn collect(
             }
         }
         if settings.history {
-            for fill in fills::by_order(&projection.fills, symbol) {
+            for fill in model.execution.fill_markers(symbol) {
                 if let Some(time_ms) = fill.occurred_ms {
                     result.push(ChartOverlay {
                         price: fill.price,
                         label: format!(
-                            "{} {} @ {}\nID: {}",
-                            if fill.order_side == OrderSide::Buy {
-                                label(language, "买入成交", "Buy fill")
-                            } else {
-                                label(language, "卖出成交", "Sell fill")
-                            },
-                            fill.quantity.normalize(),
-                            format_decimal(fill.price, model.market_scales(symbol).0),
-                            fill.native_order_id
+                            "{} @ {} {} {}",
+                            order_intent(language, fill.order_side, fill.position_side, false),
+                            model
+                                .execution
+                                .fill_execution(symbol, &fill.native_order_id)
+                                .map_or_else(
+                                    || "—".into(),
+                                    |(value, _)| value.round_dp(4).normalize().to_string()
+                                ),
+                            fill.symbol.quote(),
+                            format_decimal(fill.price, model.market_scales(symbol).0)
                         ),
                         color: side_color(fill.order_side),
                         time_ms: Some(time_ms),
@@ -361,13 +355,25 @@ pub(crate) fn draw(
             let stack = fill_stacks.entry((bar_index, buy)).or_default();
             let center = Pos2::new(x, anchor_y + direction * (13.0 + *stack as f32 * 20.0));
             *stack += 1;
-            let marker = Rect::from_center_size(center, egui::vec2(18.0, 18.0));
+            let intent = overlay
+                .label
+                .split_once(" @ ")
+                .map_or(if buy { "B" } else { "S" }, |(intent, _)| intent);
+            let marker_text = painter.layout_no_wrap(
+                intent.to_owned(),
+                FontId::proportional(11.0),
+                Color32::WHITE,
+            );
+            let marker = Rect::from_center_size(
+                center,
+                egui::vec2((marker_text.size().x + 8.0).max(18.0), 18.0),
+            );
             painter.rect_filled(marker, 5, overlay.color);
             painter.text(
                 center,
                 Align2::CENTER_CENTER,
-                if buy { "B" } else { "S" },
-                FontId::proportional(13.0),
+                intent,
+                FontId::proportional(11.0),
                 Color32::WHITE,
             );
             let response = ui.interact(

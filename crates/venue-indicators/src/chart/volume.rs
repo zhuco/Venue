@@ -3,7 +3,21 @@ use venue_domain::{FieldState, PublicBar};
 
 use super::{ChartIndicatorError, validate_bar};
 
-#[derive(Clone, Debug, Default)]
+/// One candle's actual traded quote/base ratio, distinct from cumulative typical-price VWAP.
+pub fn bar_vwap(bar: &PublicBar) -> Option<Decimal> {
+    let (FieldState::Known(base), FieldState::Known(quote)) = (&bar.base_volume, &bar.quote_volume)
+    else {
+        return None;
+    };
+    if *base <= Decimal::ZERO || *quote <= Decimal::ZERO {
+        return None;
+    }
+    quote
+        .checked_div(*base)
+        .filter(|price| *price >= bar.low.value() && *price <= bar.high.value())
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct Vwap {
     cumulative_price_volume: Decimal,
     cumulative_volume: Decimal,
@@ -12,6 +26,20 @@ pub struct Vwap {
 impl Vwap {
     pub fn new() -> Result<Self, ChartIndicatorError> {
         Ok(Self::default())
+    }
+
+    pub(crate) fn totals(&self) -> (Decimal, Decimal) {
+        (self.cumulative_price_volume, self.cumulative_volume)
+    }
+
+    pub(crate) fn from_totals(price_volume: Decimal, volume: Decimal) -> Self {
+        Self { cumulative_price_volume: price_volume, cumulative_volume: volume }
+    }
+
+    pub(crate) fn current_value(&self) -> Result<Option<Decimal>, ChartIndicatorError> {
+        if self.cumulative_volume.is_zero() { return Ok(None); }
+        self.cumulative_price_volume.checked_div(self.cumulative_volume)
+            .map(Some).ok_or(ChartIndicatorError::Arithmetic)
     }
 
     pub fn update(&mut self, bar: &PublicBar) -> Result<Option<Decimal>, ChartIndicatorError> {
@@ -41,15 +69,7 @@ impl Vwap {
             .cumulative_volume
             .checked_add(*volume)
             .ok_or(ChartIndicatorError::Arithmetic)?;
-        let value = if cumulative_volume.is_zero() {
-            None
-        } else {
-            Some(
-                cumulative_price_volume
-                    .checked_div(cumulative_volume)
-                    .ok_or(ChartIndicatorError::Arithmetic)?,
-            )
-        };
+        let value = Self::from_totals(cumulative_price_volume, cumulative_volume).current_value()?;
         self.cumulative_price_volume = cumulative_price_volume;
         self.cumulative_volume = cumulative_volume;
         Ok(value)
@@ -70,6 +90,19 @@ mod tests {
 
     use super::Vwap;
     use crate::chart::ChartIndicatorError;
+
+    #[test]
+    fn actual_bar_vwap_uses_quote_volume_and_does_not_invent_missing_data()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut input = bar(1, 110, 90, 105, Some(10))?;
+        input.quote_volume = FieldState::Known(Decimal::from(1_020));
+        assert_eq!(super::bar_vwap(&input), Some(Decimal::from(102)));
+        input.quote_volume = FieldState::Unavailable {
+            reason: UnknownReason::SourceOmitted,
+        };
+        assert!(super::bar_vwap(&input).is_none());
+        Ok(())
+    }
 
     fn bar(
         sequence: u64,

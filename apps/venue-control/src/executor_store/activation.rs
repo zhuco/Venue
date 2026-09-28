@@ -98,7 +98,7 @@ impl PgExecutorStore {
         if !leader_enabled {
             return Err(BinanceCommandLedgerError::Conflict);
         }
-        // Resuming starts from a fresh flat follower. Keep command history and monotonic target
+        // Resuming records existing positions without trading them. Keep command history and monotonic target
         // identities, but do not let a previous session's desired quantity create a catch-up order.
         sqlx::query("UPDATE venue_kol_copy_targets SET copyable_quantity='0',target_quantity='0',observed_quantity='0',dirty=false,target_revision=target_revision+1,updated_ms=$2 WHERE relation_id=$1")
             .bind(&activation.relation_id).bind(now).execute(&mut *tx).await.map_err(unavailable)?;
@@ -115,7 +115,7 @@ impl PgExecutorStore {
 fn validate_baseline(
     baseline: &AccountBaseline,
     account: &str,
-    require_empty: bool,
+    require_no_orders: bool,
     now_ms: u64,
 ) -> Result<(), BinanceCommandLedgerError> {
     let snapshot = &baseline.snapshot;
@@ -126,12 +126,8 @@ fn validate_baseline(
         && snapshot.unknown_results().is_empty()
         && snapshot.observed_at_ms() <= now_ms
         && now_ms - snapshot.observed_at_ms() <= MAX_ACTIVATION_AGE_MS
-        && (!require_empty
-            || (snapshot.open_orders().is_empty()
-                && snapshot
-                    .positions()
-                    .iter()
-                    .all(|position| position.quantity == Decimal::ZERO)));
+        && (!require_no_orders
+            || (snapshot.open_orders().is_empty() && snapshot.conditional_orders().is_empty()));
     valid
         .then_some(())
         .ok_or(BinanceCommandLedgerError::Conflict)

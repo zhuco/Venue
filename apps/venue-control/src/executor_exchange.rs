@@ -288,7 +288,7 @@ impl BinanceExecutionRouter {
     }
 
     /// Prime the actual mutation transports before installing a strategy's private baseline.
-    /// This reads public server time only; no credentials, account reads or orders are involved.
+    /// This reads public time and rules only; network waits do not own the order execution lock.
     pub async fn prepare_account_transports(
         &self,
         trading_account_id: &str,
@@ -296,15 +296,23 @@ impl BinanceExecutionRouter {
     ) -> Result<(), BinanceExecutionError> {
         for symbol in symbols {
             let exchange = self.account_exchange(trading_account_id, symbol)?;
-            let exchange = exchange.lock().await;
-            if exchange.transport.signing_timestamp_ms().is_err() {
-                exchange
-                    .transport
-                    .synchronize_clock()
+            let (clock, rules) = {
+                let exchange = exchange.lock().await;
+                (
+                    exchange
+                        .transport
+                        .signing_timestamp_ms()
+                        .is_err()
+                        .then(|| exchange.transport.prepare_clock_refresh()),
+                    self.catalogue.prepare_rules(&exchange.transport, symbol),
+                )
+            };
+            if let Some(clock) = clock {
+                clock
                     .await
                     .map_err(|_| BinanceExecutionError::Unavailable)?;
             }
-            self.catalogue.rules(&exchange.transport, symbol).await?;
+            rules.await?;
         }
         Ok(())
     }

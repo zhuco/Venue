@@ -39,6 +39,7 @@ thiserror.workspace = true
 time = { version = "0.3.55", default-features = false, features = ["std", "local-offset", "wasm-bindgen"] }
 venue-control-protocol = { path = "../../../crates/venue-control-protocol" }
 venue-domain = { path = "../../../crates/venue-domain" }
+venue-gateway-api = { path = "../../../crates/venue-gateway-api" }
 venue-indicators = { path = "../../../crates/venue-indicators" }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
@@ -49,7 +50,6 @@ tokio.workspace = true
 tokio-tungstenite.workspace = true
 tracing = "0.1"
 tracing-subscriber = "0.3"
-venue-gateway-api = { path = "../../../crates/venue-gateway-api" }
 venue-gateway-binance = { path = "../../../crates/venue-gateway-binance" }
 venue-gateway-hyperliquid = { path = "../../../crates/venue-gateway-hyperliquid" }
 venue-gateway-okx = { path = "../../../crates/venue-gateway-okx" }

@@ -1,29 +1,6 @@
 use super::*;
 use crate::chart_trading::ChartTradingSettings;
 
-#[test]
-fn crossed_line_waits_for_newer_private_facts_without_changing_orders()
--> Result<(), Box<dyn std::error::Error>> {
-    let target = selection()?;
-    let mut facts = projection()?;
-    let original = facts.clone();
-    let mut state = OrderTagState::default();
-    state.crossed_price(target.clone(), facts.observed_ms + 1);
-    assert!(state.hidden(&target));
-    assert!(!state.is_pending(&target));
-    state.observe(&facts);
-    assert!(state.hidden(&target));
-    assert_eq!(facts, original);
-    facts.observed_ms += 2;
-    state.observe(&facts);
-    assert!(!state.hidden(&target));
-    state.crossed_price(target.clone(), facts.observed_ms + 1);
-    facts.open_orders.clear();
-    state.observe(&facts);
-    assert!(!state.hidden(&target));
-    Ok(())
-}
-
 fn selection() -> Result<TerminalOrderSelection, Box<dyn std::error::Error>> {
     Ok(TerminalOrderSelection {
         credential_id: "00000000-0000-4000-8000-000000000001".into(),
@@ -90,7 +67,7 @@ impl Harness {
                     high: close + Decimal::new(20, 5),
                     low: close - Decimal::new(20, 5),
                     close,
-                    volume: Decimal::ONE,
+                    volume: Some(Decimal::ONE),
                 }
             })
             .collect::<Vec<_>>();
@@ -114,12 +91,22 @@ impl Harness {
                     crate::i18n::Language::SimplifiedChinese,
                     &settings,
                     (5, 0),
+                    None,
                     crate::chart::ChartInterval::OneMinute,
                     self.market_price,
                     None,
                     &self.display,
                     &self.overlays,
                     (None, None),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
                 );
                 if let Some(selection) = self
                     .overlays
@@ -403,6 +390,7 @@ fn projection()
     let selection = selection()?;
     let now = crate::account_center::now_ms();
     Ok(TerminalAccountProjection {
+        balance_observed_ms: None,
         schema_version: TERMINAL_PROJECTION_SCHEMA_VERSION,
         credential_id: selection.credential_id,
         trading_account_id: selection.trading_account_id,
@@ -555,7 +543,7 @@ fn sent_cancel_hides_immediately_and_uncertainty_restores_without_mutating_facts
         .position_submission_failed("cancel-request", false);
     let overlays = super::super::collect(&model, "DOGE/USDC", &ChartTradingSettings::default());
     assert_eq!(overlays.len(), 1);
-    assert_eq!(overlays[0].label, "开空 · 只做Maker");
+    assert_eq!(overlays[0].label, "开空");
     assert!(
         overlays[0]
             .badge

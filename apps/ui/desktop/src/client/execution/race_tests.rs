@@ -88,7 +88,7 @@ async fn selection_http_barrier_projection_success_empty_unavailable_401_and_aba
                     model.apply_account_overview(overview(1));
                 }
                 release.send(()).unwrap();
-                let ClientEvent::AccountScoped { scope, event } = worker.await.unwrap() else {
+                let ClientEvent::AccountScoped { scope, event } = worker.await.unwrap().1 else {
                     panic!("untagged HTTP result");
                 };
                 assert_eq!(scope, old);

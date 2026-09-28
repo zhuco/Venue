@@ -236,6 +236,8 @@ pub(super) fn show(ui: &mut egui::Ui, model: &AppModel) {
         ));
         return;
     }
+    let column_width =
+        super::table_min_column_width(super::Tab::PositionHistory, ui.available_width());
     super::history_table_scroll(
         ui,
         super::Tab::PositionHistory,
@@ -246,6 +248,7 @@ pub(super) fn show(ui: &mut egui::Ui, model: &AppModel) {
             egui::Grid::new("position-cycles")
                 .striped(true)
                 .start_row(visible.start)
+                .min_col_width(column_width)
                 .spacing([18.0, 8.0])
                 .show(ui, |ui| {
                     if visible.start == 0 {
@@ -261,7 +264,6 @@ pub(super) fn show(ui: &mut egui::Ui, model: &AppModel) {
                             ("手续费", "Fees"),
                             ("资金费", "Funding"),
                             ("净 PnL", "Net PnL"),
-                            ("覆盖", "Coverage"),
                         ] {
                             ui.weak(tr(language, zh, en));
                         }
@@ -274,11 +276,7 @@ pub(super) fn show(ui: &mut egui::Ui, model: &AppModel) {
                             .saturating_sub(visible.start.saturating_sub(1)),
                     ) {
                         ui.label(row.symbol.to_string());
-                        ui.label(if row.side == PositionSide::Long {
-                            tr(language, "多", "Long")
-                        } else {
-                            tr(language, "空", "Short")
-                        });
+                        super::position_side_label(ui, row.side, language);
                         ui.label(row.opened.map_or_else(|| "—".into(), history_time));
                         ui.label(row.closed.map_or_else(|| "—".into(), history_time));
                         super::market_price(
@@ -307,7 +305,6 @@ pub(super) fn show(ui: &mut egui::Ui, model: &AppModel) {
                         for _ in 0..3 {
                             ui.label("—");
                         }
-                        ui.weak(tr(language, "历史不完整", "Incomplete history"));
                         ui.end_row();
                     }
                 });

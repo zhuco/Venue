@@ -348,12 +348,13 @@ impl BitgetHttpTransport {
         if generation == 0 || endpoint.is_empty() {
             return Err(BitgetTransportError::Binding);
         }
-        let client = reqwest::Client::builder()
-            .connect_timeout(limits.operation_timeout)
-            .redirect(reqwest::redirect::Policy::none())
-            .no_proxy()
-            .build()
-            .map_err(|_| BitgetTransportError::Http)?;
+        let client = venue_gateway_api::transport_pool::account_http_client(
+            limits.operation_timeout,
+            None,
+            true,
+            false,
+        )
+        .map_err(|_| BitgetTransportError::Http)?;
         Ok(Self {
             client,
             binding,

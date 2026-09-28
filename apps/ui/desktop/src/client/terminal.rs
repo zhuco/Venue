@@ -40,6 +40,7 @@ impl NativeTerminalQueues {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
+#[derive(Clone)]
 struct NativeTerminalSubmitter {
     client: reqwest::Client,
     endpoint: String,
@@ -62,6 +63,35 @@ pub(super) fn start_native(
         sender,
         context,
     };
+    let cancel_submitter = submitter.clone();
+    let cancel_stop = stop.clone();
+    let cancellations = queues.cancellations;
+    tokio::spawn(async move {
+        while !cancel_stop.load(std::sync::atomic::Ordering::Acquire) {
+            if let Ok(Scoped {
+                scope,
+                value: request,
+            }) = cancellations.try_recv()
+            {
+                // Exact native-order cancellation has no dependency on unrelated admission receipts.
+                // The server still owns physical account ordering and uncertain-result fencing.
+                if cancel_submitter
+                    .submit(
+                        KOL_TERMINAL_CANCEL_PATH,
+                        &scope,
+                        &request.request_id,
+                        &request,
+                        "terminal exact cancel",
+                    )
+                    .await
+                {
+                    return;
+                }
+            } else {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        }
+    });
     tokio::spawn(async move {
         use futures_util::{StreamExt, stream::FuturesUnordered};
         let mut openings = FuturesUnordered::new();
@@ -121,25 +151,6 @@ pub(super) fn start_native(
                         &request.request_id,
                         &request,
                         "terminal order",
-                    )
-                    .await
-                {
-                    return;
-                }
-            }
-            for Scoped {
-                scope,
-                value: request,
-            } in queues.cancellations.try_iter().take(32)
-            {
-                while openings.next().await.is_some() {}
-                if submitter
-                    .submit(
-                        KOL_TERMINAL_CANCEL_PATH,
-                        &scope,
-                        &request.request_id,
-                        &request,
-                        "terminal exact cancel",
                     )
                     .await
                 {

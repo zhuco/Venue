@@ -62,6 +62,35 @@ const FILL: &str = r#"{"e":"ORDER_TRADE_UPDATE","fs":"UM","E":132,"T":130,"o":{"
 const POSITION: &str = r#"{"e":"ACCOUNT_UPDATE","fs":"UM","E":131,"T":130,"a":{"m":"ORDER","P":[{"s":"SOLUSDC","ps":"LONG","pa":"3","ep":"100","up":"0"}]}}"#;
 
 #[test]
+fn asset_refresh_has_its_own_clock_and_does_not_advance_position_facts()
+-> Result<(), Box<dyn std::error::Error>> {
+    let mut state = state()?;
+    state.balances = Some((
+        vec![SignedAccountBalance {
+            asset: "USD".parse()?,
+            equity: 75.into(),
+            available_margin: Some(60.into()),
+        }],
+        180,
+    ));
+    let before = state.snapshot(150, 2)?.ok_or("snapshot")?;
+    assert_eq!(before.balances()[0].equity, Decimal::from(50));
+    assert_eq!(before.balance_observed_at_ms(), 100);
+    let after = state.snapshot(200, 2)?.ok_or("snapshot")?;
+    assert_eq!(after.balances()[0].equity, Decimal::from(75));
+    assert_eq!(after.balance_observed_at_ms(), 180);
+    assert_eq!(after.observed_at_ms(), 200);
+    assert_eq!(after.positions(), before.positions());
+    assert!(
+        after
+            .clone()
+            .with_balances_at(after.balances().to_vec(), 201)
+            .is_err()
+    );
+    Ok(())
+}
+
+#[test]
 fn amendment_preserves_source_identity_and_creation_cutoff()
 -> Result<(), Box<dyn std::error::Error>> {
     let mut projection = state()?;
@@ -202,8 +231,13 @@ fn missing_execution_after_position_update_becomes_a_gap_not_fresh_inventory()
 -> Result<(), Box<dyn std::error::Error>> {
     let mut state = state()?;
     apply(&mut state, POSITION)?;
-    assert!(state.snapshot(200, 2)?.is_none());
-    assert!(state.snapshot(5_201, 2).is_err());
+    let now = Instant::now();
+    assert!(state.snapshot_at(200, 2, now)?.is_none());
+    assert!(
+        state
+            .snapshot_at(200, 2, now + Duration::from_secs(5))
+            .is_err()
+    );
     Ok(())
 }
 
@@ -278,6 +312,46 @@ fn later_account_update_time_does_not_require_another_trade()
 }
 
 #[test]
+fn matching_inventory_publishes_when_fill_clock_is_ahead_of_position_clock()
+-> Result<(), Box<dyn std::error::Error>> {
+    let mut state = state()?;
+    apply(&mut state, NEW)?;
+    apply(
+        &mut state,
+        &FILL
+            .replace("\"E\":132", "\"E\":141")
+            .replace("\"T\":130", "\"T\":140"),
+    )?;
+    apply(&mut state, POSITION)?;
+    assert!(
+        state.snapshot(150, 2)?.is_some(),
+        "matching inventory must publish even when ORDER_TRADE_UPDATE T is later than ACCOUNT_UPDATE T"
+    );
+    Ok(())
+}
+
+#[test]
+fn unresolved_inventory_gap_starts_from_first_incomplete_observation()
+-> Result<(), Box<dyn std::error::Error>> {
+    let mut state = state()?;
+    apply(&mut state, FILL)?;
+    let now = Instant::now();
+    assert!(state.snapshot_at(200, 2, now)?.is_none());
+    state.last_change_received_ms = 4_000;
+    assert!(
+        state
+            .snapshot_at(200, 2, now + Duration::from_millis(4_999))?
+            .is_none()
+    );
+    assert!(
+        state
+            .snapshot_at(200, 2, now + Duration::from_secs(5))
+            .is_err()
+    );
+    Ok(())
+}
+
+#[test]
 fn matching_timestamps_cannot_hide_conflicting_position_quantity()
 -> Result<(), Box<dyn std::error::Error>> {
     let mut state = state()?;
@@ -287,7 +361,54 @@ fn matching_timestamps_cannot_hide_conflicting_position_quantity()
         &mut state,
         &POSITION.replace("\"pa\":\"3\"", "\"pa\":\"4\""),
     )?;
-    assert!(state.snapshot(200, 2)?.is_none());
-    assert!(state.snapshot(5_201, 2).is_err());
+    let now = Instant::now();
+    assert!(state.snapshot_at(200, 2, now)?.is_none());
+    assert!(
+        state
+            .snapshot_at(200, 2, now + Duration::from_secs(5))
+            .is_err()
+    );
+    Ok(())
+}
+
+#[test]
+fn converged_inventory_resets_deadline_without_freshening_facts()
+-> Result<(), Box<dyn std::error::Error>> {
+    let mut state = state()?;
+    let now = Instant::now();
+    apply(&mut state, FILL)?;
+    assert!(state.snapshot_at(200, 2, now)?.is_none());
+    apply(&mut state, POSITION)?;
+    let snapshot = state
+        .snapshot_at(200, 2, now + Duration::from_secs(4))?
+        .ok_or("snapshot")?;
+    assert_eq!(snapshot.observed_at_ms(), 200);
+    state.last_published_ms = 200;
+    assert!(
+        state
+            .snapshot_at(200, 2, now + Duration::from_secs(10))?
+            .is_none()
+    );
+    apply(
+        &mut state,
+        &POSITION
+            .replace("\"E\":131", "\"E\":231")
+            .replace("\"pa\":\"3\"", "\"pa\":\"4\""),
+    )?;
+    assert!(
+        state
+            .snapshot_at(240, 2, now + Duration::from_secs(11))?
+            .is_none()
+    );
+    assert!(
+        state
+            .snapshot_at(240, 2, now + Duration::from_secs(15))?
+            .is_none()
+    );
+    assert!(
+        state
+            .snapshot_at(240, 2, now + Duration::from_secs(16))
+            .is_err()
+    );
     Ok(())
 }

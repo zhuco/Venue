@@ -28,6 +28,34 @@ pub enum ChartIndicatorId {
 
 impl ChartIndicatorId {
     #[must_use]
+    pub const fn category(self) -> ChartIndicatorCategory {
+        match self {
+            Self::Sar | Self::Supertrend => ChartIndicatorCategory::PriceStructure,
+            Self::Vwap | Self::Avl | Self::Volume | Self::Mfi | Self::Obv | Self::Emv => {
+                ChartIndicatorCategory::FlowLiquidity
+            }
+            Self::Bollinger | Self::Atr => ChartIndicatorCategory::Volatility,
+            Self::Ma | Self::Ema | Self::Wma | Self::Trix | Self::Macd | Self::Rsi
+            | Self::Kdj | Self::Cci | Self::StochRsi | Self::WilliamsR | Self::Dmi
+            | Self::Momentum => ChartIndicatorCategory::Traditional,
+        }
+    }
+
+    #[must_use]
+    pub const fn short_label(self) -> &'static str {
+        match self {
+            Self::Ma => "MA", Self::Ema => "EMA", Self::Wma => "WMA",
+            Self::Bollinger => "BOLL", Self::Vwap => "VWAP", Self::Avl => "AVL",
+            Self::Trix => "TRIX", Self::Sar => "SAR", Self::Supertrend => "SUPER",
+            Self::Volume => "VOL", Self::Macd => "MACD", Self::Rsi => "RSI",
+            Self::Mfi => "MFI", Self::Kdj => "KDJ", Self::Obv => "OBV",
+            Self::Cci => "CCI", Self::StochRsi => "StochRSI",
+            Self::WilliamsR => "WR", Self::Dmi => "DMI", Self::Momentum => "MTM",
+            Self::Emv => "EMV", Self::Atr => "ATR",
+        }
+    }
+
+    #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Ma => "ma",
@@ -62,6 +90,20 @@ pub enum ChartIndicatorPlacement {
     Pane,
 }
 
+impl Default for ChartIndicatorId {
+    fn default() -> Self {
+        Self::Supertrend
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ChartIndicatorCategory {
+    PriceStructure,
+    FlowLiquidity,
+    Volatility,
+    Traditional,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ChartParameterDescriptor {
     pub key: &'static str,
@@ -76,6 +118,8 @@ pub struct ChartParameterDescriptor {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ChartIndicatorDescriptor {
     pub id: ChartIndicatorId,
+    pub category: ChartIndicatorCategory,
+    pub short_label: &'static str,
     pub name_zh_cn: &'static str,
     pub name_en: &'static str,
     pub placement: ChartIndicatorPlacement,
@@ -160,6 +204,8 @@ macro_rules! study {
     ($id:ident, $zh:literal, $en:literal, $place:ident, $input:literal, $output:literal, $params:expr, $version:literal) => {
         ChartIndicatorDescriptor {
             id: ChartIndicatorId::$id,
+            category: ChartIndicatorId::$id.category(),
+            short_label: ChartIndicatorId::$id.short_label(),
             name_zh_cn: $zh,
             name_en: $en,
             placement: ChartIndicatorPlacement::$place,

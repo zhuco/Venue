@@ -14,6 +14,8 @@ pub(crate) struct BrowserMarket {
     sender: crossbeam_channel::Sender<Result<Snapshot, String>>,
     receiver: crossbeam_channel::Receiver<Result<Snapshot, String>>,
     pending: bool,
+    request_started_ms: u64,
+    clock_anchor_ms: u64,
     next_ms: u64,
     received_ms: u64,
 }
@@ -28,12 +30,52 @@ impl Default for BrowserMarket {
             sender,
             receiver,
             pending: false,
+            request_started_ms: 0,
+            clock_anchor_ms: 0,
             next_ms: 0,
             received_ms: 0,
         }
     }
 }
 impl BrowserMarket {
+    pub fn public_now_ms(&self, local_now: u64) -> u64 {
+        // Include the entire request duration, conservatively aging data during transit.
+        self.snapshot
+            .as_ref()
+            .filter(|snapshot| snapshot.captured_at_ms > 0)
+            .filter(|_| self.clock_anchor_ms > 0 && local_now >= self.clock_anchor_ms)
+            .map_or(0, |snapshot| {
+                snapshot
+                    .captured_at_ms
+                    .saturating_add(local_now - self.clock_anchor_ms)
+            })
+    }
+
+    pub fn series_for_symbol<'a>(&'a self, symbol: &'a str) -> impl Iterator<Item = &'a Series> {
+        self.snapshot
+            .iter()
+            .flat_map(|snapshot| &snapshot.series)
+            .filter(move |series| series.symbol == symbol)
+    }
+
+    pub fn depth_series(&self, symbol: &str, now: u64) -> Option<&Series> {
+        self.snapshot
+            .as_ref()?
+            .series
+            .iter()
+            .filter(|series| series.symbol == symbol && series.depth_is_fresh(now))
+            .max_by_key(|series| (series.depth_event_ms, series.depth_received_ms))
+    }
+
+    pub fn tape_series(&self, symbol: &str) -> Option<&Series> {
+        self.snapshot
+            .as_ref()?
+            .series
+            .iter()
+            .filter(|series| series.symbol == symbol)
+            .max_by_key(|series| series.trades.last().map(|trade| trade.occurred_ms))
+    }
+
     pub fn series(&self, symbol: &str, interval: Option<ChartInterval>) -> Option<&Series> {
         self.snapshot.as_ref()?.series.iter().find(|series| {
             series.symbol == symbol && interval.is_none_or(|value| value == series.interval)
@@ -60,6 +102,7 @@ impl BrowserMarket {
                         .map(|item| format!("{}: {}", item.symbol, item.status))
                         .collect::<Vec<_>>()
                         .join(" · ");
+                    self.clock_anchor_ms = self.request_started_ms;
                     self.snapshot = Some(snapshot);
                     self.received_ms = now;
                 }
@@ -80,6 +123,7 @@ impl BrowserMarket {
             return;
         }
         self.pending = true;
+        self.request_started_ms = now;
         self.next_ms = now.saturating_add(500);
         let wanted = self.wanted.clone();
         let sender = self.sender.clone();

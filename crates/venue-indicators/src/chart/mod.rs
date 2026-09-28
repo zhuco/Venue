@@ -5,26 +5,35 @@
 
 mod common;
 mod custom_ema_adx;
+pub mod liquidation_scenario;
+pub mod anchored_vwap;
+pub mod open_interest;
+pub mod session_levels;
+pub mod support_resistance;
 mod momentum;
+mod order_flow;
 mod registry;
+pub mod script;
 mod trend;
 mod volatility;
 mod volume;
+pub mod volume_profile;
 
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
-use venue_domain::{PublicBar, Symbol};
+use venue_domain::{FieldState, PublicBar, Symbol};
 
 pub use common::{CommonStudyValues, DirectionalValue, DmiValue, KdjValue, PairValue, TripleValue};
 pub use custom_ema_adx::{EmaAdxConfig, EmaAdxSignal, EmaAdxValues};
 pub use momentum::{Macd, MacdValue, Rsi};
+pub use order_flow::{CvdResetMode, OrderFlowValue, aggregate_minute_flow};
 pub use registry::{
-    ChartIndicatorDescriptor, ChartIndicatorId, ChartIndicatorPlacement, ChartIndicatorRegistry,
+    ChartIndicatorCategory, ChartIndicatorDescriptor, ChartIndicatorId, ChartIndicatorPlacement, ChartIndicatorRegistry,
     ChartParameterDescriptor,
 };
 pub use trend::{Ema, Sma};
 pub use volatility::{Atr, BollingerBands, BollingerValue};
-pub use volume::Vwap;
+pub use volume::{Vwap, bar_vwap};
 
 #[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum ChartIndicatorError {
@@ -44,6 +53,9 @@ pub enum ChartIndicatorError {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ChartStudyValues {
+    pub custom_scripts: Vec<script::ScriptFrame>,
+    pub bar_vwap: Option<Decimal>,
+    pub order_flow: OrderFlowValue,
     pub custom_ema_adx: Option<EmaAdxValues>,
     pub sma: Option<Decimal>,
     pub ema: Option<Decimal>,
@@ -58,6 +70,8 @@ pub struct ChartStudyValues {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ChartStudyConfig {
+    pub cvd_reset_mode: CvdResetMode,
+    pub custom_scripts: Vec<script::ScriptSpec>,
     pub custom_ema_adx: Option<EmaAdxConfig>,
     pub sma_period: usize,
     pub ema_period: usize,
@@ -96,6 +110,8 @@ pub struct ChartStudyConfig {
 impl Default for ChartStudyConfig {
     fn default() -> Self {
         Self {
+            cvd_reset_mode: CvdResetMode::LoadedContinuous,
+            custom_scripts: Vec::new(),
             custom_ema_adx: None,
             sma_period: 7,
             ema_period: 7,
@@ -135,6 +151,13 @@ impl Default for ChartStudyConfig {
 
 impl ChartStudyConfig {
     pub fn validate(&self) -> Result<(), ChartIndicatorError> {
+        if self.custom_scripts.len() > script::MAX_SCRIPTS {
+            return Err(ChartIndicatorError::InvalidParameters);
+        }
+        for spec in &self.custom_scripts {
+            script::ScriptEngine::compile(spec)
+                .map_err(|_| ChartIndicatorError::InvalidParameters)?;
+        }
         if let Some(config) = &self.custom_ema_adx {
             config.validate()?;
         }
@@ -188,6 +211,8 @@ impl ChartStudyConfig {
 /// Fixed first-batch study set used by the chart and future explicit adapters.
 #[derive(Clone, Debug)]
 pub struct ChartStudyEngine {
+    custom_scripts: Vec<script::ScriptEngine>,
+    order_flow: order_flow::OrderFlow,
     custom_ema_adx: Option<custom_ema_adx::EmaAdxStudy>,
     scope: Option<ChartScope>,
     last_close_time_ms: Option<u64>,
@@ -216,6 +241,13 @@ impl ChartStudyEngine {
     pub fn with_config(config: &ChartStudyConfig) -> Result<Self, ChartIndicatorError> {
         config.validate()?;
         Ok(Self {
+            custom_scripts: config
+                .custom_scripts
+                .iter()
+                .map(script::ScriptEngine::compile)
+                .collect::<Result<_, _>>()
+                .map_err(|_| ChartIndicatorError::InvalidParameters)?,
+            order_flow: order_flow::OrderFlow::new(config.cvd_reset_mode),
             custom_ema_adx: config
                 .custom_ema_adx
                 .as_ref()
@@ -239,6 +271,10 @@ impl ChartStudyEngine {
     }
 
     pub fn reset(&mut self) {
+        for script in &mut self.custom_scripts {
+            script.reset();
+        }
+        self.order_flow = order_flow::OrderFlow::new(self.order_flow.mode());
         if let Some(custom) = &mut self.custom_ema_adx {
             custom.reset();
         }
@@ -284,6 +320,13 @@ impl ChartStudyEngine {
         bar: &PublicBar,
     ) -> Result<ChartStudyValues, ChartIndicatorError> {
         Ok(ChartStudyValues {
+            custom_scripts: self
+                .custom_scripts
+                .iter_mut()
+                .map(|script| script.update(bar))
+                .collect(),
+            bar_vwap: volume::bar_vwap(bar),
+            order_flow: self.order_flow.update(bar),
             custom_ema_adx: self
                 .custom_ema_adx
                 .as_mut()
@@ -292,7 +335,12 @@ impl ChartStudyEngine {
             sma: self.sma.update(bar)?,
             ema: self.ema.update(bar)?,
             bollinger: self.bollinger.update(bar)?,
-            vwap: self.vwap.update(bar)?,
+            vwap: if matches!(&bar.base_volume, FieldState::Known(_)) {
+                self.vwap.update(bar)?
+            } else {
+                self.vwap.reset();
+                None
+            },
             rsi: self.rsi.update(bar)?,
             macd: self.macd.update(bar)?,
             atr: self.atr.update(bar)?,
@@ -349,7 +397,7 @@ pub(super) fn validate_bar(bar: &PublicBar) -> Result<(), ChartIndicatorError> {
 #[cfg(test)]
 mod tests {
     use rust_decimal::Decimal;
-    use venue_domain::{FieldState, Price, PublicBar};
+    use venue_domain::{FieldState, Price, PublicBar, UnknownReason};
 
     use super::{ChartIndicatorError, ChartStudyConfig, ChartStudyEngine};
 
@@ -429,6 +477,63 @@ mod tests {
         assert!(values.common.dmi.is_some());
         assert!(values.common.momentum.is_some());
         assert!(values.common.emv.is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn missing_quote_volume_only_interrupts_avl() -> Result<(), Box<dyn std::error::Error>> {
+        let mut engine = ChartStudyEngine::standard()?;
+        for sequence in 1..=40 {
+            engine.ingest_closed(&bar(sequence)?)?;
+        }
+        let mut missing = bar(41)?;
+        missing.quote_volume = FieldState::Unavailable {
+            reason: UnknownReason::SourceOmitted,
+        };
+        missing.trade_count = FieldState::Unavailable {
+            reason: UnknownReason::SourceOmitted,
+        };
+        missing.taker_buy_quote_volume = FieldState::Unavailable {
+            reason: UnknownReason::SourceOmitted,
+        };
+        let values = engine.ingest_closed(&missing)?;
+        assert!(values.common.avl.is_none());
+        assert!(values.sma.is_some());
+        assert!(values.rsi.is_some());
+
+        let resumed = engine.ingest_closed(&bar(42)?)?;
+        assert!(resumed.common.avl.is_some());
+        assert_eq!(resumed.common.avl, Some(Decimal::from(142)));
+        Ok(())
+    }
+
+    #[test]
+    fn missing_base_volume_preserves_price_studies() -> Result<(), Box<dyn std::error::Error>> {
+        let mut engine = ChartStudyEngine::standard()?;
+        for sequence in 1..=40 {
+            engine.ingest_closed(&bar(sequence)?)?;
+        }
+        let mut missing = bar(41)?;
+        let unavailable = FieldState::Unavailable {
+            reason: UnknownReason::SourceOmitted,
+        };
+        missing.base_volume = unavailable.clone();
+        missing.quote_volume = unavailable.clone();
+        missing.trade_count = FieldState::Unavailable {
+            reason: UnknownReason::SourceOmitted,
+        };
+        missing.taker_buy_base_volume = unavailable.clone();
+        missing.taker_buy_quote_volume = unavailable;
+        let values = engine.ingest_closed(&missing)?;
+        assert!(values.sma.is_some());
+        assert!(values.rsi.is_some());
+        assert!(values.vwap.is_none());
+        assert!(values.common.mfi.is_none());
+        assert!(values.common.obv.is_none());
+        assert!(values.common.emv.is_none());
+        let resumed = engine.ingest_closed(&bar(42)?)?;
+        assert!(resumed.vwap.is_some());
+        assert!(resumed.common.obv.is_some());
         Ok(())
     }
 

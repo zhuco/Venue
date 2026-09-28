@@ -19,7 +19,7 @@ function Assert-GuardThrows([scriptblock]$Action,[string]$Pattern) {
 $repo = Split-Path -Parent $PSScriptRoot
 $first = Get-VenueBuildPlan -RepoRoot $repo
 $second = Get-VenueBuildPlan -RepoRoot $repo
-Assert-GuardTest ($first.BudgetBytes -eq 200GB) 'Local budget matches the authorized 200 GiB policy'
+Assert-GuardTest ($first.BudgetBytes -eq 500GB) 'Local budget matches the authorized 500 GiB policy'
 Assert-GuardTest ($first.TargetDirectory -eq $second.TargetDirectory) 'Stable cache selection'
 Assert-GuardTest ($first.TargetDirectory -in @('G:\Build\Venue\main','G:\Build\Venue\slot-1','G:\Build\Venue\slot-2')) 'Only three targets'
 Assert-GuardThrows { Get-VenueBuildPlan -RepoRoot $repo -RequestedTarget 'G:\Build\Venue\new-target-12345' } 'Arbitrary target'
@@ -71,6 +71,7 @@ try {
     Assert-GuardTest ($env:CARGO_BUILD_BUILD_DIR -eq $env:CARGO_TARGET_DIR) 'Intermediate build directory cannot escape'
     Assert-GuardTest ($env:CARGO_INCREMENTAL -eq '1') 'Main retains incremental cache'
     Assert-GuardTest ([object]::Equals([Environment]::GetEnvironmentVariable('RUSTC_WRAPPER','Process'),'')) 'Main explicitly disables the outer wrapper, including Cargo config defaults'
+    Assert-GuardTest ([object]::Equals([Environment]::GetEnvironmentVariable('CARGO_BUILD_RUSTC_WRAPPER','Process'),'')) 'Main overrides the Cargo-configured wrapper too'
     Assert-GuardThrows { Enter-VenueBuildGuard -RepoRoot $repo -WaitSeconds 0 } 'Nested build'
 
     # Verify the lock is visible in another OS process, not just this PowerShell runspace.
@@ -91,6 +92,7 @@ try {
         Restore-VenueBuildEnvironment @{RUSTC_WRAPPER=$wrapperSample}
         $activeLease = Enter-VenueBuildGuard -RepoRoot $repo -WaitSeconds 0
         Assert-GuardTest ([object]::Equals([Environment]::GetEnvironmentVariable('RUSTC_WRAPPER','Process'),'')) 'Every main lease selects direct incremental compilation'
+        Assert-GuardTest ([object]::Equals([Environment]::GetEnvironmentVariable('CARGO_BUILD_RUSTC_WRAPPER','Process'),'')) 'Every main lease overrides Cargo config'
         try { throw 'simulated main validation failure' } catch { } finally { Exit-VenueBuildGuard $activeLease; $activeLease=$null }
         Assert-GuardTest ([object]::Equals([Environment]::GetEnvironmentVariable('RUSTC_WRAPPER','Process'),$wrapperSample)) 'Failure restores unset, empty and sccache wrapper values exactly'
     }

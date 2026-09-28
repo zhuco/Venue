@@ -1,4 +1,7 @@
 use eframe::egui::{self, Align2, Color32, RichText, Stroke};
+#[cfg(test)]
+#[path = "settings_panel_custom_tests.rs"]
+mod custom_save_tests;
 
 use crate::{
     chart_settings::{ChartDisplaySettings, IndicatorStyle},
@@ -6,76 +9,31 @@ use crate::{
     model::AppModel,
     theme,
 };
+use venue_indicators::chart::{ChartIndicatorCategory, ChartIndicatorId, ChartIndicatorRegistry};
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 enum SettingsTab {
     #[default]
-    Main,
-    Sub,
+    PriceStructure,
+    FlowLiquidity,
+    Volatility,
+    Traditional,
     Custom,
     Backtest,
     General,
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-enum IndicatorKind {
-    Ma,
-    Ema,
-    Wma,
-    Bollinger,
-    Vwap,
-    Avl,
-    Trix,
-    Sar,
-    #[default]
-    Supertrend,
-    Volume,
-    Macd,
-    Rsi,
-    Mfi,
-    Kdj,
-    Obv,
-    Cci,
-    StochRsi,
-    WilliamsR,
-    Dmi,
-    Momentum,
-    Emv,
-    Atr,
-}
+type IndicatorKind = ChartIndicatorId;
 
-const MAIN_INDICATORS: &[(IndicatorKind, &str)] = &[
-    (IndicatorKind::Ma, "MA"),
-    (IndicatorKind::Ema, "EMA"),
-    (IndicatorKind::Wma, "WMA"),
-    (IndicatorKind::Bollinger, "BOLL"),
-    (IndicatorKind::Vwap, "VWAP"),
-    (IndicatorKind::Avl, "AVL"),
-    (IndicatorKind::Trix, "TRIX"),
-    (IndicatorKind::Sar, "SAR"),
-    (IndicatorKind::Supertrend, "SUPER"),
-];
-
-const SUB_INDICATORS: &[(IndicatorKind, &str)] = &[
-    (IndicatorKind::Volume, "VOL"),
-    (IndicatorKind::Macd, "MACD"),
-    (IndicatorKind::Rsi, "RSI"),
-    (IndicatorKind::Mfi, "MFI"),
-    (IndicatorKind::Kdj, "KDJ"),
-    (IndicatorKind::Obv, "OBV"),
-    (IndicatorKind::Cci, "CCI"),
-    (IndicatorKind::StochRsi, "StochRSI"),
-    (IndicatorKind::WilliamsR, "WR"),
-    (IndicatorKind::Dmi, "DMI"),
-    (IndicatorKind::Momentum, "MTM"),
-    (IndicatorKind::Emv, "EMV"),
-    (IndicatorKind::Atr, "ATR"),
-];
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SpecialPanel { Structure, OrderFlow, ProfileOi }
 
 #[derive(Clone, Debug, Default)]
 pub struct SettingsPanelState {
+    custom_editor: crate::custom_indicator::LibraryEditor,
     tab: SettingsTab,
     indicator: IndicatorKind,
+    special: Option<SpecialPanel>,
     draft: Option<ChartDisplaySettings>,
     original: Option<ChartDisplaySettings>,
     error: Option<String>,
@@ -92,11 +50,13 @@ impl SettingsPanelState {
     pub fn focus_indicators(&mut self, target: Option<String>) {
         self.clear();
         self.target = target;
-        self.tab = SettingsTab::Main;
+        self.tab = SettingsTab::PriceStructure;
         self.indicator = IndicatorKind::Supertrend;
+        self.special = None;
     }
 
     fn clear(&mut self) {
+        self.custom_editor = Default::default();
         self.draft = None;
         self.original = None;
         self.error = None;
@@ -133,27 +93,37 @@ pub fn show(
         .resizable(false)
         .collapsible(false)
         .anchor(Align2::CENTER_CENTER, egui::Vec2::ZERO)
-        .fixed_size(egui::vec2(720.0, 535.0))
+        .fixed_size(
+            egui::vec2(720.0, 535.0).min(context.content_rect().size() - egui::vec2(32.0, 32.0)),
+        )
         .frame(
             egui::Frame::new()
                 .fill(Color32::from_rgb(31, 38, 50))
                 .stroke(Stroke::new(1.0, Color32::from_rgb(54, 64, 79)))
-                .inner_margin(egui::Margin::ZERO)
+                .inner_margin(egui::Margin::same(16))
                 .corner_radius(egui::CornerRadius::same(8)),
         )
         .show(context, |ui| {
-            ui.set_min_size(egui::vec2(720.0, 535.0));
             top_tabs(ui, state, language, &mut close_requested);
             ui.separator();
             match state.tab {
-                SettingsTab::Main | SettingsTab::Sub => indicator_body(ui, state, language),
+                SettingsTab::PriceStructure | SettingsTab::FlowLiquidity
+                | SettingsTab::Volatility | SettingsTab::Traditional => {
+                    indicator_body(ui, state, language)
+                }
                 SettingsTab::Custom => {
                     if let Some(draft) = &mut state.draft {
-                        crate::custom_indicator::settings_ui(
-                            ui,
-                            &mut draft.custom_ema_adx,
-                            language,
-                        );
+                        egui::ScrollArea::vertical()
+                            .id_salt("custom-library-body")
+                            .max_height(400.0)
+                            .show(ui, |ui| {
+                                crate::custom_indicator::settings_ui(
+                                    ui,
+                                    draft,
+                                    &mut state.custom_editor,
+                                    language,
+                                )
+                            });
                     }
                 }
                 SettingsTab::Backtest => placeholder(ui, language),
@@ -168,6 +138,15 @@ pub fn show(
             Ok(()) => state.error = None,
             Err(error) => state.error = Some(error),
         }
+    }
+    if state.custom_editor.pending() && state.error.is_none() {
+        state.error =
+            Some("请先保存指标或取消编辑 / Save the indicator or cancel editing first".into());
+    }
+    if saved && state.error.is_some() {
+        saved = false;
+        close_requested = false;
+        window_open = true;
     }
     if close_requested {
         window_open = false;
@@ -187,38 +166,30 @@ fn top_tabs(
     language: Language,
     close: &mut bool,
 ) {
-    ui.allocate_ui_with_layout(
-        egui::vec2(ui.available_width(), 58.0),
-        egui::Layout::left_to_right(egui::Align::Center),
-        |ui| {
-            ui.add_space(18.0);
-            for (tab, key) in [
-                (SettingsTab::Main, IndicatorTextKey::MainTab),
-                (SettingsTab::Sub, IndicatorTextKey::SubTab),
-                (SettingsTab::Custom, IndicatorTextKey::CustomTab),
-                (SettingsTab::Backtest, IndicatorTextKey::BacktestTab),
-                (SettingsTab::General, IndicatorTextKey::GeneralTab),
-            ] {
-                ui.add_enabled_ui(!matches!(tab, SettingsTab::Backtest), |ui| {
-                    tab_button(ui, &mut state.tab, tab, indicator_text(language, key));
-                })
-                .response
-                .on_disabled_hover_text(indicator_text(
-                    language,
-                    IndicatorTextKey::FeatureUnavailable,
-                ));
-                ui.add_space(16.0);
-            }
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui
-                    .add(egui::Button::new(RichText::new("×").size(28.0)).frame(false))
-                    .clicked()
-                {
-                    *close = true;
+    ui.horizontal(|ui| {
+        let width = (ui.available_width() - 42.0).max(180.0);
+        egui::ScrollArea::horizontal().max_width(width).show(ui, |ui| {
+            ui.horizontal(|ui| {
+                let zh = language == Language::SimplifiedChinese;
+                for (tab, title) in [
+                    (SettingsTab::PriceStructure, if zh { "价格结构" } else { "Price structure" }),
+                    (SettingsTab::FlowLiquidity, if zh { "成交与流动性" } else { "Flow & liquidity" }),
+                    (SettingsTab::Volatility, if zh { "波动" } else { "Volatility" }),
+                    (SettingsTab::Traditional, if zh { "传统指标" } else { "Traditional" }),
+                    (SettingsTab::Custom, indicator_text(language, IndicatorTextKey::CustomTab)),
+                    (SettingsTab::Backtest, indicator_text(language, IndicatorTextKey::BacktestTab)),
+                    (SettingsTab::General, indicator_text(language, IndicatorTextKey::GeneralTab)),
+                ] {
+                    ui.add_enabled_ui(tab != SettingsTab::Backtest, |ui| {
+                        tab_button(ui, &mut state.tab, tab, title);
+                    }).response.on_disabled_hover_text(indicator_text(language, IndicatorTextKey::FeatureUnavailable));
                 }
             });
-        },
-    );
+        });
+        if ui.add(egui::Button::new(RichText::new("×").size(28.0)).frame(false)).clicked() {
+            *close = true;
+        }
+    });
 }
 
 fn tab_button(ui: &mut egui::Ui, current: &mut SettingsTab, tab: SettingsTab, title: &str) {
@@ -243,13 +214,21 @@ fn tab_button(ui: &mut egui::Ui, current: &mut SettingsTab, tab: SettingsTab, ti
 }
 
 fn indicator_body(ui: &mut egui::Ui, state: &mut SettingsPanelState, language: Language) {
-    let list = if state.tab == SettingsTab::Main {
-        MAIN_INDICATORS
-    } else {
-        SUB_INDICATORS
+    let category = match state.tab {
+        SettingsTab::PriceStructure => ChartIndicatorCategory::PriceStructure,
+        SettingsTab::FlowLiquidity => ChartIndicatorCategory::FlowLiquidity,
+        SettingsTab::Volatility => ChartIndicatorCategory::Volatility,
+        SettingsTab::Traditional => ChartIndicatorCategory::Traditional,
+        _ => return,
     };
-    if !list.iter().any(|(kind, _)| *kind == state.indicator) {
-        state.indicator = list[0].0;
+    let list = ChartIndicatorRegistry::all().iter().filter(|item| item.category == category).collect::<Vec<_>>();
+    if !list.iter().any(|item| item.id == state.indicator) {
+        state.indicator = list[0].id;
+    }
+    if !matches!((category, state.special),
+        (ChartIndicatorCategory::PriceStructure, Some(SpecialPanel::Structure))
+        | (ChartIndicatorCategory::FlowLiquidity, Some(SpecialPanel::OrderFlow | SpecialPanel::ProfileOi))) {
+        state.special = None;
     }
     ui.horizontal(|ui| {
         ui.allocate_ui_with_layout(
@@ -258,14 +237,7 @@ fn indicator_body(ui: &mut egui::Ui, state: &mut SettingsPanelState, language: L
             |ui| {
                 ui.add_space(10.0);
                 ui.label(
-                    RichText::new(indicator_text(
-                        language,
-                        if state.tab == SettingsTab::Main {
-                            IndicatorTextKey::MainGroup
-                        } else {
-                            IndicatorTextKey::SubGroup
-                        },
-                    ))
+                    RichText::new(if language == Language::SimplifiedChinese { "指标" } else { "Studies" })
                     .size(13.0)
                     .strong()
                     .color(theme::TEXT_PRIMARY),
@@ -277,13 +249,25 @@ fn indicator_body(ui: &mut egui::Ui, state: &mut SettingsPanelState, language: L
                         let Some(draft) = state.draft.as_mut() else {
                             return;
                         };
-                        for (kind, name) in list {
+                        let zh = language == Language::SimplifiedChinese;
+                        if category == ChartIndicatorCategory::PriceStructure {
+                            special_list_row(ui, &mut state.special, SpecialPanel::Structure,
+                                if zh { "S/R · 日周位" } else { "S/R · levels" });
+                        }
+                        if category == ChartIndicatorCategory::FlowLiquidity {
+                            special_list_row(ui, &mut state.special, SpecialPanel::OrderFlow,
+                                if zh { "热图 · Delta" } else { "Heatmap · Delta" });
+                            special_list_row(ui, &mut state.special, SpecialPanel::ProfileOi,
+                                if zh { "Profile · OI" } else { "Profile · OI" });
+                        }
+                        for item in list {
                             indicator_list_row(
                                 ui,
                                 &mut state.indicator,
-                                *kind,
-                                name,
-                                style_mut(draft, *kind),
+                                &mut state.special,
+                                item.id,
+                                item.short_label,
+                                style_mut(draft, item.id),
                             );
                         }
                     });
@@ -299,7 +283,19 @@ fn indicator_body(ui: &mut egui::Ui, state: &mut SettingsPanelState, language: L
                 let Some(draft) = state.draft.as_mut() else {
                     return;
                 };
-                indicator_editor(ui, draft, state.indicator, language);
+                if let Some(panel) = state.special
+                    && ui.small_button(if language == Language::SimplifiedChinese {
+                        "恢复本组默认"
+                    } else { "Reset this group" }).clicked()
+                {
+                    reset_special_panel(draft, panel);
+                }
+                match state.special {
+                    Some(SpecialPanel::Structure) => structure_settings(ui, draft, language),
+                    Some(SpecialPanel::OrderFlow) => crate::chart_view::microstructure::settings_ui(ui, &mut draft.microstructure, language),
+                    Some(SpecialPanel::ProfileOi) => profile_oi_settings(ui, draft, language),
+                    None => indicator_editor(ui, draft, state.indicator, language),
+                }
             },
         );
     });
@@ -308,11 +304,12 @@ fn indicator_body(ui: &mut egui::Ui, state: &mut SettingsPanelState, language: L
 fn indicator_list_row(
     ui: &mut egui::Ui,
     selected: &mut IndicatorKind,
+    special: &mut Option<SpecialPanel>,
     kind: IndicatorKind,
     name: &str,
     style: &mut IndicatorStyle,
 ) {
-    let is_selected = *selected == kind;
+    let is_selected = *selected == kind && special.is_none();
     let frame = egui::Frame::new()
         .fill(if is_selected {
             Color32::from_rgb(45, 55, 70)
@@ -332,8 +329,72 @@ fn indicator_list_row(
             ui.label(RichText::new("›").size(16.0).color(theme::TEXT_SECONDARY));
             if response.clicked() {
                 *selected = kind;
+                *special = None;
             }
         });
+    });
+}
+
+fn special_list_row(ui: &mut egui::Ui, selected: &mut Option<SpecialPanel>, panel: SpecialPanel, name: &str) {
+    if ui.selectable_label(*selected == Some(panel), name).clicked() {
+        *selected = Some(panel);
+    }
+}
+
+fn structure_settings(ui: &mut egui::Ui, draft: &mut ChartDisplaySettings, language: Language) {
+    let tr = |zh, en| if language == Language::SimplifiedChinese { zh } else { en };
+    egui::ScrollArea::vertical().max_height(370.0).show(ui, |ui| {
+        let session = &mut draft.session;
+        ui.heading(tr("自动支撑／阻力 · 本地结构", "Support / Resistance · local structure"));
+        ui.checkbox(&mut session.sr_current, tr("当前周期 S/R", "Current timeframe S/R"));
+        ui.horizontal(|ui| {
+            ui.checkbox(&mut session.sr_15m, "15m");
+            ui.checkbox(&mut session.sr_1h, "1h");
+            ui.checkbox(&mut session.sr_1d, "1d");
+        });
+        ui.small(tr("评分用于已确认拐点排序，不是交易成功概率。", "Score ranks confirmed swings; it is not a trading probability."));
+        ui.separator();
+        ui.heading(tr("UTC 日周位置", "UTC day and week levels"));
+        ui.horizontal(|ui| { ui.checkbox(&mut session.pdh, "PDH"); ui.checkbox(&mut session.pdl, "PDL"); });
+        ui.horizontal(|ui| { ui.checkbox(&mut session.pwh, "PWH"); ui.checkbox(&mut session.pwl, "PWL"); });
+        ui.horizontal(|ui| {
+            ui.checkbox(&mut session.daily_open, tr("当日开盘", "Daily Open"));
+            ui.checkbox(&mut session.weekly_open, tr("当周开盘", "Weekly Open"));
+        });
+        ui.separator();
+        ui.checkbox(&mut session.daily_pivot, tr("日 Pivot · P / R1 / R2 / S1 / S2", "Daily Pivot · P / R1 / R2 / S1 / S2"));
+        ui.checkbox(&mut session.weekly_pivot, tr("周 Pivot · P / R1 / R2 / S1 / S2", "Weekly Pivot · P / R1 / R2 / S1 / S2"));
+        ui.checkbox(&mut session.pivot_r3_s3, "R3 / S3");
+        ui.small(tr("只使用完整收盘的前一 UTC 日／周；来源缺失时不画线。",
+            "Uses only the preceding complete UTC day/week. Missing source leaves a gap."));
+    });
+}
+
+fn profile_oi_settings(ui: &mut egui::Ui, draft: &mut ChartDisplaySettings, language: Language) {
+    let tr = |zh, en| if language == Language::SimplifiedChinese { zh } else { en };
+    egui::ScrollArea::vertical().max_height(370.0).show(ui, |ui| {
+        let profile = &mut draft.profile;
+        ui.heading(tr("成交量分布 · 1m OHLCV 估算", "Volume Profile · 1m OHLCV estimate"));
+        ui.checkbox(&mut profile.visible_range, tr("可见区间", "Visible Range"));
+        ui.checkbox(&mut profile.fixed_range, tr("固定区间", "Fixed Range"));
+        ui.horizontal(|ui| {
+            ui.label(tr("价格桶 tick ×", "Bucket tick ×"));
+            ui.add(egui::DragValue::new(&mut profile.tick_multiple).range(1..=1_000));
+            ui.label(tr("宽度 %", "Width %"));
+            ui.add(egui::DragValue::new(&mut profile.width_percent).range(10..=35));
+            ui.label(tr("不透明度 %", "Opacity %"));
+            ui.add(egui::DragValue::new(&mut profile.opacity_percent).range(10..=80));
+        });
+        ui.horizontal(|ui| { ui.checkbox(&mut profile.poc, "POC"); ui.checkbox(&mut profile.vah, "VAH"); ui.checkbox(&mut profile.val, "VAL"); });
+        if profile.fixed_range {
+            ui.small(tr("在图表上使用“框选 Profile”依次点击起点与终点。",
+                "Use Select Profile on the chart, then click start and end."));
+        }
+        ui.separator();
+        ui.heading(tr("持仓量 OI", "Open Interest"));
+        ui.checkbox(&mut draft.oi_pane, tr("OI 副图 · 基础币数量", "OI pane · base asset quantity"));
+        ui.small(tr("按所选场所和合约显示真实样本；没有历史来源时留空。",
+            "Shows samples for the selected venue and contract; missing history stays blank."));
     });
 }
 
@@ -343,11 +404,18 @@ fn indicator_editor(
     kind: IndicatorKind,
     language: Language,
 ) {
-    ui.label(
-        RichText::new(indicator_text(language, indicator_title(kind)))
+    ui.horizontal(|ui| {
+        ui.label(RichText::new(ChartIndicatorRegistry::all().iter().find(|item| item.id == kind)
+            .map(|item| if language == Language::SimplifiedChinese { item.name_zh_cn } else { item.name_en })
+            .unwrap_or(kind.short_label()))
             .size(14.0)
-            .strong(),
-    );
+            .strong());
+        if ui.small_button(if language == Language::SimplifiedChinese {
+            "恢复本项默认"
+        } else { "Reset this study" }).clicked() {
+            reset_selected_indicator(settings, kind);
+        }
+    });
     ui.add_space(18.0);
     match kind {
         IndicatorKind::Ma => triple_lines(
@@ -571,13 +639,13 @@ fn indicator_editor(
             &mut settings.emv_period,
             &mut settings.emv,
         ),
-        IndicatorKind::Atr => simple_period_style(
-            ui,
-            language,
-            "ATR",
-            &mut settings.atr_period,
-            &mut settings.atr,
-        ),
+        IndicatorKind::Atr => {
+            simple_period_style(
+                ui, language, "ATR", &mut settings.atr_period, &mut settings.atr,
+            );
+            ui.checkbox(&mut settings.atr_value_readout, if language == Language::SimplifiedChinese { "顶部显示 ATR 数值" } else { "Show ATR value in readout" });
+            ui.checkbox(&mut settings.atr_percent_readout, if language == Language::SimplifiedChinese { "顶部显示 ATR%" } else { "Show ATR% in readout" });
+        }
     }
 }
 
@@ -595,9 +663,16 @@ fn triple_lines(
             _ => &mut style.tertiary_color,
         };
         ui.horizontal(|ui| {
-            ui.checkbox(
-                &mut style.line_enabled[index],
-                format!("{prefix}{}", index + 1),
+            ui.allocate_ui_with_layout(
+                egui::vec2(120.0, 32.0),
+                egui::Layout::left_to_right(egui::Align::Center),
+                |ui| {
+                    ui.set_min_size(egui::vec2(120.0, 32.0));
+                    ui.checkbox(
+                        &mut style.line_enabled[index],
+                        format!("{prefix}{}", index + 1),
+                    );
+                },
             );
             ui.add_sized(
                 [102.0, 32.0],
@@ -608,6 +683,17 @@ fn triple_lines(
         });
         ui.add_space(8.0);
     }
+}
+
+fn field_label(ui: &mut egui::Ui, label: impl Into<egui::WidgetText>) {
+    ui.allocate_ui_with_layout(
+        egui::vec2(120.0, 32.0),
+        egui::Layout::left_to_right(egui::Align::Center),
+        |ui| {
+            ui.set_min_size(egui::vec2(120.0, 32.0));
+            ui.label(label);
+        },
+    );
 }
 
 fn simple_period_style(
@@ -638,7 +724,7 @@ fn period_line(
     source: bool,
 ) {
     ui.horizontal(|ui| {
-        ui.label(RichText::new(name).size(13.0).strong());
+        field_label(ui, RichText::new(name).size(13.0).strong());
         ui.add_sized(
             [102.0, 32.0],
             egui::DragValue::new(period).range(1..=100_000),
@@ -681,12 +767,9 @@ fn value_row(
     divisor: f64,
 ) {
     ui.horizontal(|ui| {
+        field_label(ui, indicator_text(language, key));
         ui.add_sized(
-            [120.0, 30.0],
-            egui::Label::new(indicator_text(language, key)),
-        );
-        ui.add_sized(
-            [108.0, 32.0],
+            [102.0, 32.0],
             egui::DragValue::new(value)
                 .range(range)
                 .custom_formatter(move |raw, _| format!("{:.4}", raw / divisor)),
@@ -703,13 +786,15 @@ fn two_periods(
     key_b: IndicatorTextKey,
     b: &mut u32,
 ) {
-    ui.horizontal(|ui| {
-        ui.label(indicator_text(language, key_a));
-        ui.add(egui::DragValue::new(a).range(1..=100_000));
-        ui.add_space(20.0);
-        ui.label(indicator_text(language, key_b));
-        ui.add(egui::DragValue::new(b).range(1..=100_000));
-    });
+    for (key, value) in [(key_a, a), (key_b, b)] {
+        ui.horizontal(|ui| {
+            field_label(ui, indicator_text(language, key));
+            ui.add_sized(
+                [102.0, 32.0],
+                egui::DragValue::new(value).range(1..=100_000),
+            );
+        });
+    }
     ui.add_space(12.0);
 }
 
@@ -721,12 +806,9 @@ fn three_periods(
 ) {
     for (key, value) in keys.into_iter().zip(values) {
         ui.horizontal(|ui| {
+            field_label(ui, indicator_text(language, key));
             ui.add_sized(
-                [95.0, 28.0],
-                egui::Label::new(indicator_text(language, key)),
-            );
-            ui.add_sized(
-                [105.0, 30.0],
+                [102.0, 32.0],
                 egui::DragValue::new(value).range(1..=100_000),
             );
         });
@@ -736,7 +818,7 @@ fn three_periods(
 
 fn single_style(ui: &mut egui::Ui, language: Language, style: &mut IndicatorStyle) {
     ui.horizontal(|ui| {
-        ui.label(indicator_text(language, IndicatorTextKey::Line));
+        field_label(ui, indicator_text(language, IndicatorTextKey::Line));
         line_sample(ui, &mut style.color, &mut style.line_width_tenths);
     });
 }
@@ -744,7 +826,7 @@ fn single_style(ui: &mut egui::Ui, language: Language, style: &mut IndicatorStyl
 fn secondary_style(ui: &mut egui::Ui, language: Language, style: &mut IndicatorStyle, title: &str) {
     single_style(ui, language, style);
     ui.horizontal(|ui| {
-        ui.label(title);
+        field_label(ui, title);
         ui.color_edit_button_srgb(&mut style.secondary_color);
     });
 }
@@ -782,16 +864,16 @@ fn directional_styles(
         (false, &mut style.secondary_color),
     ] {
         ui.horizontal(|ui| {
-            ui.add_sized(
-                [120.0, 30.0],
-                egui::Label::new(indicator_text(
+            field_label(
+                ui,
+                indicator_text(
                     language,
                     if rising {
                         IndicatorTextKey::RisingLine
                     } else {
                         IndicatorTextKey::FallingLine
                     },
-                )),
+                ),
             );
             ui.label(
                 RichText::new("━━━━━━").color(Color32::from_rgb(color[0], color[1], color[2])),
@@ -815,7 +897,7 @@ fn directional_styles(
 
 fn fill_opacity(ui: &mut egui::Ui, language: Language, style: &mut IndicatorStyle) {
     ui.horizontal(|ui| {
-        ui.label(indicator_text(language, IndicatorTextKey::FillOpacity));
+        field_label(ui, indicator_text(language, IndicatorTextKey::FillOpacity));
         ui.add(egui::Slider::new(&mut style.fill_opacity_percent, 0..=40).suffix("%"));
     });
 }
@@ -843,7 +925,6 @@ fn bottom_actions(
                     .fill(Color32::from_rgb(252, 213, 53)),
                 )
                 .clicked()
-                && state.error.is_none()
             {
                 *saved = true;
                 *close = true;
@@ -857,6 +938,7 @@ fn bottom_actions(
                 .clicked()
             {
                 state.draft = Some(ChartDisplaySettings::default());
+                state.custom_editor = Default::default();
             }
             if let Some(error) = &state.error {
                 ui.colored_label(theme::SELL, error);
@@ -971,6 +1053,12 @@ fn apply_chart_settings(
     _language: Language,
     target: Option<&str>,
 ) -> Result<(), String> {
+    let current = target
+        .and_then(|key| model.preferences.chart_overrides.get(key))
+        .unwrap_or(&model.preferences.chart);
+    if current == settings {
+        return Ok(());
+    }
     settings.validate().map_err(str::to_owned)?;
     if let Some(target) = target {
         model
@@ -991,6 +1079,68 @@ fn apply_chart_settings(
         })?;
     model.preferences.chart = settings.clone();
     Ok(())
+}
+
+fn reset_special_panel(settings: &mut ChartDisplaySettings, panel: SpecialPanel) {
+    let defaults = ChartDisplaySettings::default();
+    match panel {
+        SpecialPanel::Structure => settings.session = defaults.session,
+        SpecialPanel::OrderFlow => settings.microstructure = defaults.microstructure,
+        SpecialPanel::ProfileOi => {
+            settings.profile = defaults.profile;
+            settings.oi_pane = defaults.oi_pane;
+        }
+    }
+}
+
+fn reset_selected_indicator(settings: &mut ChartDisplaySettings, kind: IndicatorKind) {
+    let mut defaults = ChartDisplaySettings::default();
+    *style_mut(settings, kind) = *style_mut(&mut defaults, kind);
+    match kind {
+        IndicatorKind::Ma => settings.ma_periods = defaults.ma_periods,
+        IndicatorKind::Ema => settings.ema_periods = defaults.ema_periods,
+        IndicatorKind::Wma => settings.wma_periods = defaults.wma_periods,
+        IndicatorKind::Bollinger => {
+            settings.bollinger_period = defaults.bollinger_period;
+            settings.bollinger_multiplier_hundredths = defaults.bollinger_multiplier_hundredths;
+        }
+        IndicatorKind::Vwap | IndicatorKind::Avl | IndicatorKind::Volume | IndicatorKind::Obv => {}
+        IndicatorKind::Trix => settings.trix_period = defaults.trix_period,
+        IndicatorKind::Sar => {
+            settings.sar_step_ten_thousandths = defaults.sar_step_ten_thousandths;
+            settings.sar_maximum_ten_thousandths = defaults.sar_maximum_ten_thousandths;
+        }
+        IndicatorKind::Supertrend => {
+            settings.supertrend_period = defaults.supertrend_period;
+            settings.supertrend_multiplier_hundredths = defaults.supertrend_multiplier_hundredths;
+        }
+        IndicatorKind::Macd => {
+            settings.macd_fast_period = defaults.macd_fast_period;
+            settings.macd_slow_period = defaults.macd_slow_period;
+            settings.macd_signal_period = defaults.macd_signal_period;
+        }
+        IndicatorKind::Rsi => settings.rsi_period = defaults.rsi_period,
+        IndicatorKind::Mfi => settings.mfi_period = defaults.mfi_period,
+        IndicatorKind::Kdj => {
+            settings.kdj_period = defaults.kdj_period;
+            settings.kdj_signal_period = defaults.kdj_signal_period;
+        }
+        IndicatorKind::Cci => settings.cci_period = defaults.cci_period,
+        IndicatorKind::StochRsi => {
+            settings.stoch_rsi_period = defaults.stoch_rsi_period;
+            settings.stoch_rsi_stochastic_period = defaults.stoch_rsi_stochastic_period;
+            settings.stoch_rsi_signal_period = defaults.stoch_rsi_signal_period;
+        }
+        IndicatorKind::WilliamsR => settings.williams_r_period = defaults.williams_r_period,
+        IndicatorKind::Dmi => settings.dmi_period = defaults.dmi_period,
+        IndicatorKind::Momentum => settings.momentum_period = defaults.momentum_period,
+        IndicatorKind::Emv => settings.emv_period = defaults.emv_period,
+        IndicatorKind::Atr => {
+            settings.atr_period = defaults.atr_period;
+            settings.atr_value_readout = defaults.atr_value_readout;
+            settings.atr_percent_readout = defaults.atr_percent_readout;
+        }
+    }
 }
 
 fn style_mut(settings: &mut ChartDisplaySettings, kind: IndicatorKind) -> &mut IndicatorStyle {
@@ -1020,36 +1170,32 @@ fn style_mut(settings: &mut ChartDisplaySettings, kind: IndicatorKind) -> &mut I
     }
 }
 
-const fn indicator_title(kind: IndicatorKind) -> IndicatorTextKey {
-    match kind {
-        IndicatorKind::Ma => IndicatorTextKey::MaTitle,
-        IndicatorKind::Ema => IndicatorTextKey::EmaTitle,
-        IndicatorKind::Wma => IndicatorTextKey::WmaTitle,
-        IndicatorKind::Bollinger => IndicatorTextKey::BollTitle,
-        IndicatorKind::Vwap => IndicatorTextKey::VwapTitle,
-        IndicatorKind::Avl => IndicatorTextKey::AvlTitle,
-        IndicatorKind::Trix => IndicatorTextKey::TrixTitle,
-        IndicatorKind::Sar => IndicatorTextKey::SarTitle,
-        IndicatorKind::Supertrend => IndicatorTextKey::SuperTitle,
-        IndicatorKind::Volume => IndicatorTextKey::VolTitle,
-        IndicatorKind::Macd => IndicatorTextKey::MacdTitle,
-        IndicatorKind::Rsi => IndicatorTextKey::RsiTitle,
-        IndicatorKind::Mfi => IndicatorTextKey::MfiTitle,
-        IndicatorKind::Kdj => IndicatorTextKey::KdjTitle,
-        IndicatorKind::Obv => IndicatorTextKey::ObvTitle,
-        IndicatorKind::Cci => IndicatorTextKey::CciTitle,
-        IndicatorKind::StochRsi => IndicatorTextKey::StochRsiTitle,
-        IndicatorKind::WilliamsR => IndicatorTextKey::WilliamsRTitle,
-        IndicatorKind::Dmi => IndicatorTextKey::DmiTitle,
-        IndicatorKind::Momentum => IndicatorTextKey::MomentumTitle,
-        IndicatorKind::Emv => IndicatorTextKey::EmvTitle,
-        IndicatorKind::Atr => IndicatorTextKey::AtrTitle,
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{MAIN_INDICATORS, SUB_INDICATORS, SettingsTab};
+    use super::SettingsTab;
+
+    #[test]
+    fn resetting_one_study_or_group_preserves_other_chart_choices() {
+        use venue_indicators::chart::ChartIndicatorId;
+        let defaults = crate::chart_settings::ChartDisplaySettings::default();
+        let mut chart = defaults.clone();
+        chart.ma_periods = [2, 3, 4];
+        chart.ma.enabled = !defaults.ma.enabled;
+        chart.ema_periods = [10, 20, 30];
+        chart.session.pdh = false;
+        chart.profile.visible_range = true;
+        chart.oi_pane = true;
+        super::reset_selected_indicator(&mut chart, ChartIndicatorId::Ma);
+        assert_eq!(chart.ma_periods, defaults.ma_periods);
+        assert_eq!(chart.ma, defaults.ma);
+        assert_eq!(chart.ema_periods, [10, 20, 30]);
+        assert!(!chart.session.pdh);
+        assert!(chart.profile.visible_range);
+        super::reset_special_panel(&mut chart, super::SpecialPanel::ProfileOi);
+        assert_eq!(chart.profile, defaults.profile);
+        assert_eq!(chart.oi_pane, defaults.oi_pane);
+        assert!(!chart.session.pdh);
+    }
 
     #[test]
     fn server_settings_apply_only_valid_explicit_changes_in_both_languages() {
@@ -1212,9 +1358,9 @@ mod tests {
                 }
             }
             let enable = if language == crate::i18n::Language::English {
-                "Enable this study"
+                "Enabled"
             } else {
-                "启用此指标"
+                "启用"
             };
             for label in [
                 enable,
@@ -1265,21 +1411,51 @@ mod tests {
     }
 
     #[test]
-    fn settings_expose_only_the_confirmed_main_and_sub_indicator_groups() {
-        assert_eq!(MAIN_INDICATORS.len(), 9);
-        assert_eq!(SUB_INDICATORS.len(), 13);
-        assert_eq!(SettingsTab::default(), SettingsTab::Main);
-        let names = MAIN_INDICATORS
-            .iter()
-            .chain(SUB_INDICATORS)
-            .map(|(_, name)| *name)
-            .collect::<Vec<_>>();
-        assert_eq!(
-            names,
-            [
-                "MA", "EMA", "WMA", "BOLL", "VWAP", "AVL", "TRIX", "SAR", "SUPER", "VOL", "MACD",
-                "RSI", "MFI", "KDJ", "OBV", "CCI", "StochRSI", "WR", "DMI", "MTM", "EMV", "ATR",
-            ]
-        );
+    fn settings_groups_use_the_registry_without_duplicating_studies() {
+        use venue_indicators::chart::{ChartIndicatorCategory, ChartIndicatorRegistry};
+        assert_eq!(SettingsTab::default(), SettingsTab::PriceStructure);
+        let descriptors = ChartIndicatorRegistry::all();
+        assert_eq!(descriptors.len(), 22);
+        for category in [ChartIndicatorCategory::PriceStructure,
+            ChartIndicatorCategory::FlowLiquidity, ChartIndicatorCategory::Volatility,
+            ChartIndicatorCategory::Traditional] {
+            assert!(descriptors.iter().any(|item| item.category == category));
+        }
+        assert!(descriptors.iter().all(|item| !item.short_label.is_empty()));
+    }
+
+    #[test]
+    fn structure_and_flow_controls_remain_visible_in_their_categories() {
+        use eframe::egui;
+        fn labels(shape: &egui::Shape, output: &mut Vec<String>) {
+            match shape {
+                egui::Shape::Text(text) => output.push(text.galley.job.text.clone()),
+                egui::Shape::Vec(shapes) => shapes.iter().for_each(|shape| labels(shape, output)),
+                _ => {}
+            }
+        }
+        for (tab, special, expected) in [
+            (SettingsTab::PriceStructure, super::SpecialPanel::Structure, "当前周期 S/R"),
+            (SettingsTab::FlowLiquidity, super::SpecialPanel::OrderFlow, "Delta · base"),
+            (SettingsTab::FlowLiquidity, super::SpecialPanel::ProfileOi, "OI 副图 · 基础币数量"),
+        ] {
+            let context = egui::Context::default();
+            crate::theme::apply(&context);
+            let mut model = crate::model::AppModel::new(Default::default());
+            let mut state = super::SettingsPanelState { tab, special: Some(special), ..Default::default() };
+            let mut open = true;
+            let mut reconnect = false;
+            let mut rendered = Vec::new();
+            for _ in 0..3 {
+                let mut output = context.run_ui(egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1100.0, 700.0))),
+                    ..Default::default()
+                }, |ui| super::show(ui.ctx(), &mut open, &mut state, &mut model, &mut reconnect));
+                output.textures_delta.clear();
+                rendered.clear();
+                for shape in output.shapes { labels(&shape.shape, &mut rendered); }
+            }
+            assert!(rendered.iter().any(|label| label == expected), "missing {expected} in {tab:?}");
+        }
     }
 }

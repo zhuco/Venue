@@ -236,6 +236,8 @@ fn validate_mark(
         || mark.received_at_ms == 0
         || mark.exchange_time_ms == 0
         || mark.exchange_time_ms > mark.received_at_ms
+        || mark.time_source != venue_domain::MarketTimeSource::Exchange
+        || !matches!(mark.mark_price, venue_domain::FieldState::Known(_))
         || mark.received_at_ms > private.observed_at_ms
         || private.observed_at_ms.saturating_sub(mark.received_at_ms) > config.mark_stale_after_ms
     {
@@ -249,6 +251,9 @@ fn make_observation(
     private: &PrivateFacts,
     mark: &MarkFunding,
 ) -> Result<EpisodeObservation, ScalpingEpisodeObservationSourceError> {
+    let venue_domain::FieldState::Known(mark_price) = mark.mark_price else {
+        return Err(ScalpingEpisodeObservationSourceError::StaleOrInvalidMark);
+    };
     let mut observation = EpisodeObservation {
         binding_digest: config.binding.digest(),
         episode_id: config.active_episode_id.clone(),
@@ -260,7 +265,7 @@ fn make_observation(
         mark_generation: mark.generation,
         mark_received_at_ms: mark.received_at_ms,
         mark_exchange_time_ms: mark.exchange_time_ms,
-        mark_price: mark.mark_price,
+        mark_price,
     };
     observation.observation_fact_id = episode_observation_fact_id(&observation)
         .map_err(|_| ScalpingEpisodeObservationSourceError::ObservationIdentity)?;

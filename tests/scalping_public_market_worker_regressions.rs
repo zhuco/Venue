@@ -333,7 +333,8 @@ fn mark_funding_is_recorded_without_becoming_book_trade_or_bar_readiness()
     assert!(matches!(
         output.event.event,
         venue::domain::MarketEvent::MarkFunding(mark)
-            if mark.mark_price.value() == rust_decimal::Decimal::new(1005, 1)
+            if matches!(mark.mark_price, venue::domain::FieldState::Known(price)
+                if price.value() == rust_decimal::Decimal::new(1005, 1))
     ));
     assert_eq!(output.state, FeatureState::Warmup);
     assert!(output.frame.is_none());

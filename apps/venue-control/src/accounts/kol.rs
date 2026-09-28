@@ -268,7 +268,7 @@ impl AccountService {
             }
         }
         let credential =
-            verified_empty_credential(&mut tx, principal, &request.settings, now_ms).await?;
+            verified_follow_credential(&mut tx, principal, &request.settings, now_ms).await?;
         let binding = sqlx::query(
             "SELECT b.kol_user_id,p.leader_trading_account_id FROM venue_user_kol_bindings b \
              JOIN venue_kol_profiles p ON p.kol_user_id=b.kol_user_id \
@@ -459,7 +459,7 @@ impl AccountService {
         match request.action {
             FollowLifecycleAction::Activate => {
                 let settings = follow_relation_settings(&row)?;
-                let _ = verified_empty_credential(&mut tx, principal, &settings, now_ms).await?;
+                let _ = verified_follow_credential(&mut tx, principal, &settings, now_ms).await?;
                 let state: String = row.try_get("relation_state").map_err(database_error)?;
                 if state != "paused" {
                     return Err(error(Code::Conflict));
@@ -537,6 +537,25 @@ impl AccountService {
         now_ms: u64,
         cached: Option<&TerminalAccountProjection>,
     ) -> Result<Option<TerminalAccountProjection>, AccountError> {
+        self.terminal_account_projection_update(principal, request, now_ms, cached)
+            .await
+            .map(|(mut projection, _)| {
+                // The legacy HTTP response keeps its exact schema; clocks are opt-in on SSE.
+                if let Some(value) = &mut projection {
+                    value.balance_observed_ms = None;
+                }
+                projection
+            })
+    }
+
+    /// Only persisted projections can be read faster without increasing exchange traffic.
+    pub(crate) async fn terminal_account_projection_update(
+        &self,
+        principal: &Principal,
+        request: TerminalProjectionRequest,
+        now_ms: u64,
+        cached: Option<&TerminalAccountProjection>,
+    ) -> Result<(Option<TerminalAccountProjection>, bool), AccountError> {
         request.validate().map_err(|_| error(Code::InvalidInput))?;
         let store =
             crate::private_projection::BinancePrivateProjectionStore::new(self.pool.clone());
@@ -549,7 +568,7 @@ impl AccountService {
             return self
                 .strategy_terminal_projection(principal, &credential, &request)
                 .await
-                .map(Some);
+                .map(|projection| (Some(projection), false));
         }
         store
             .subscribe(
@@ -563,6 +582,7 @@ impl AccountService {
         store
             .load_owned_for_display(&principal.user.user_id, &request.credential_id, cached)
             .await
+            .map(|projection| (projection, true))
             .map_err(projection_error)
     }
 }
@@ -578,7 +598,7 @@ fn projection_error(
     }
 }
 
-async fn verified_empty_credential(
+async fn verified_follow_credential(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     principal: &Principal,
     settings: &FollowRiskSettings,
@@ -596,9 +616,6 @@ async fn verified_empty_credential(
     )?;
     if !summary.selectable(now_ms) {
         return Err(error(Code::VerificationRequired));
-    }
-    if summary.has_exposure != Some(false) {
-        return Err(error(Code::AccountInUse));
     }
     if row
         .try_get::<Option<String>, _>("trading_account_id")
@@ -810,6 +827,7 @@ mod tests {
                         account_identity_hash: [29; 32],
                         observed_ms: timestamp,
                         has_exposure: false,
+                        has_open_orders: false,
                         equity: Decimal::from(100),
                         available_margin: Decimal::from(80),
                     })

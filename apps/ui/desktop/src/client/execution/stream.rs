@@ -1,7 +1,9 @@
 use super::*;
 use crate::client::{parse_sse_frame, sse_boundary};
 use venue_control_protocol::kol::KOL_TERMINAL_ACCOUNT_STREAM_PATH;
-use venue_control_protocol::terminal_account_stream::{COMPACT_QUERY, TerminalAccountStreamEvent};
+use venue_control_protocol::terminal_account_stream::{
+    ASSET_CLOCK_QUERY, COMPACT_QUERY, TerminalAccountStreamEvent,
+};
 
 const FRAME_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
@@ -12,11 +14,12 @@ pub(super) async fn receive(
     sender: &crossbeam_channel::Sender<ClientEvent>,
     context: &eframe::egui::Context,
 ) -> Result<(), TerminalReadError> {
-    let response = tokio::time::timeout(
+    let started = std::time::Instant::now();
+    let mut response = tokio::time::timeout(
         super::super::REQUEST_TIMEOUT,
         client
             .post(format!(
-                "{}?{COMPACT_QUERY}",
+                "{}?{ASSET_CLOCK_QUERY}",
                 path(endpoint, KOL_TERMINAL_ACCOUNT_STREAM_PATH)
             ))
             .json(&request.value)
@@ -25,6 +28,22 @@ pub(super) async fn receive(
     .await
     .map_err(|_| terminal_unavailable("Account stream connect timed out"))?
     .map_err(|_| terminal_unavailable("Account stream unavailable"))?;
+    // A desktop can precede the server rollout. Older servers reject only the optional query.
+    if response.status().as_u16() == 400 {
+        response = tokio::time::timeout(
+            super::super::REQUEST_TIMEOUT,
+            client
+                .post(format!(
+                    "{}?{COMPACT_QUERY}",
+                    path(endpoint, KOL_TERMINAL_ACCOUNT_STREAM_PATH)
+                ))
+                .json(&request.value)
+                .send(),
+        )
+        .await
+        .map_err(|_| terminal_unavailable("Account stream connect timed out"))?
+        .map_err(|_| terminal_unavailable("Account stream unavailable"))?;
+    }
     if response.status().as_u16() == 401 {
         return Err(TerminalReadError::SessionExpired);
     }
@@ -37,6 +56,16 @@ pub(super) async fn receive(
         .is_some_and(|v| v.as_bytes().starts_with(b"text/event-stream"))
     {
         return Err(terminal_unavailable("Invalid account stream content type"));
+    }
+    if let Some(clock) = crate::execution_view::account_clock::AccountClock::from_response(
+        response.headers(),
+        u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+    ) {
+        publish(
+            sender,
+            context,
+            request.scope.event(ClientEvent::AccountClock(clock)),
+        );
     }
     let mut bytes = response.bytes_stream();
     let mut buffer = Vec::new();
@@ -63,25 +92,22 @@ pub(super) async fn receive(
             let frame = parse_sse_frame(text)
                 .map_err(|_| terminal_unavailable("Invalid account stream frame"))?;
             if let Some(payload) = frame.payload {
-                let previous_observed = projection
-                    .as_ref()
-                    .map(|p: &TerminalAccountProjection| p.observed_ms);
                 let update: TerminalAccountStreamEvent = serde_json::from_str(&payload)
                     .map_err(|_| terminal_unavailable("Invalid account stream projection"))?;
                 update
-                    .apply(&mut projection)
+                    .apply_shared(&mut projection)
                     .map_err(|_| terminal_unavailable("Account stream baseline mismatch"))?;
-                let event = ClientEvent::TerminalAccountProjection {
+                let event = ClientEvent::TerminalAccountSharedProjection {
                     credential_id: request.value.credential_id.clone(),
                     projection: projection.clone(),
                 };
                 if !request.scope.accepts(&event)
                     || matches!(&event,
-                    ClientEvent::TerminalAccountProjection { projection: Some(p), .. } if p.validate().is_err())
+                    ClientEvent::TerminalAccountSharedProjection { projection: Some(p), .. } if p.validate().is_err())
                 {
                     return Err(terminal_unavailable("Account stream scope mismatch"));
                 }
-                if let ClientEvent::TerminalAccountProjection {
+                if let ClientEvent::TerminalAccountSharedProjection {
                     projection: Some(p),
                     ..
                 } = &event
@@ -99,11 +125,9 @@ pub(super) async fn receive(
                     }
                 }
                 publish(sender, context, request.scope.event(event));
-                if projection.is_none()
-                    || projection.as_ref().map(|p| p.observed_ms) > previous_observed
-                {
-                    deadline = tokio::time::Instant::now() + FRAME_TIMEOUT;
-                }
+                // A validated frame proves the connection is live even when the signed
+                // observation time has not advanced. Fact freshness is checked separately.
+                deadline = tokio::time::Instant::now() + FRAME_TIMEOUT;
             }
             buffer.drain(..boundary + delimiter);
         }

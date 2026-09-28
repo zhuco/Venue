@@ -93,7 +93,56 @@ pub(super) async fn verify(
             break;
         }
     }
-    assert_eq!(received, Some(current));
+    assert_eq!(received, Some(current.clone()));
+    // A committed partial/final fill must update the order and history together,
+    // without waiting for the five-second display-history TTL.
+    for (trade, filled) in [("partial", 1), ("final", 2)] {
+        current.observed_ms += 1;
+        current.persisted_ms += 1;
+        let order = &expected.open_orders[0];
+        let fill = serde_json::json!({
+            "native_order_id": order.native_order_id, "native_trade_id": trade,
+            "symbol": order.symbol, "order_side": order.order_side,
+            "position_side": order.position_side, "quantity":"0.0005", "price":"50000"
+        });
+        current
+            .fills
+            .insert(0, serde_json::from_value(fill.clone())?);
+        if filled == 1 {
+            current.open_orders[0].filled_quantity = Some(rust_decimal::Decimal::new(5, 4));
+        } else {
+            current.open_orders.clear();
+        }
+        let mut tx = fixture.pool.begin().await?;
+        sqlx::query("INSERT INTO venue_binance_account_fills (trading_account_id,owner_user_id,native_trade_id,symbol,observed_ms,fill_json) VALUES ($1,$2,$3,$4,$5,$6)")
+            .bind(&current.trading_account_id).bind(&alice.user.user_id).bind(trade)
+            .bind(order.symbol.to_string()).bind(i64::try_from(current.observed_ms)?).bind(fill)
+            .execute(&mut *tx).await?;
+        sqlx::query("UPDATE venue_binance_account_projections SET projection_json=$1 WHERE credential_id=$2")
+            .bind(serde_json::json!({"fills_cursor":"fixture-cursor","stream_healthy":true,"projection":current}))
+            .bind(&request.credential_id).execute(&mut *tx).await?;
+        tx.commit().await?;
+        time::timeout(Duration::from_millis(450), async {
+            loop {
+                let next: TerminalAccountStreamEvent =
+                    serde_json::from_str(&frame(&mut response, &mut buffer).await?)?;
+                next.apply(&mut received)?;
+                if received
+                    .as_ref()
+                    .is_some_and(|p| p.observed_ms == current.observed_ms)
+                {
+                    assert_eq!(received.as_ref(), Some(&current));
+                    return Ok::<_, Box<dyn std::error::Error>>(());
+                }
+            }
+        })
+        .await??;
+    }
+    sqlx::query("DELETE FROM venue_binance_account_fills WHERE trading_account_id=$1 AND native_trade_id IN ('partial','final')")
+        .bind(&current.trading_account_id).execute(&fixture.pool).await?;
+    sqlx::query("UPDATE venue_binance_account_projections SET projection_json=$1 WHERE credential_id=$2")
+        .bind(serde_json::json!({"fills_cursor":"fixture-cursor","stream_healthy":true,"projection":expected}))
+        .bind(&request.credential_id).execute(&fixture.pool).await?;
     drop(response);
     verify_history_budget(fixture, server, alice, bob, request, expected).await?;
     Ok(())
@@ -139,14 +188,25 @@ async fn verify_history_budget(
         .ok_or("execution missing")?;
     assert_eq!(execution.fills.len(), 150);
     assert_eq!(execution.position_history.len(), 151);
-    // A cached display update must not query either history table, while account ownership
-    // and generation changes must still prevent history from crossing its original scope.
+    // A trade can commit before the position/order projection changes. A cached account
+    // surface must still pick up that trade without waiting for the old five-second TTL.
+    let mut new_fill = display.fills[0].clone();
+    new_fill.native_trade_id = "151".into();
+    sqlx::query("INSERT INTO venue_binance_account_fills (trading_account_id,owner_user_id,native_trade_id,symbol,observed_ms,fill_json) VALUES ($1,$2,'151','BTC/USDT',151,$3)")
+        .bind(account).bind(user).bind(serde_json::to_value(new_fill)?).execute(&fixture.pool).await?;
+    let refreshed = store
+        .load_owned_for_display(user, &request.credential_id, Some(&display))
+        .await?
+        .ok_or("missing display")?;
+    assert_eq!(refreshed.fills[0].native_trade_id, "151");
+    assert_eq!(refreshed.positions, display.positions);
+    // Missing history must not be silently presented as an up-to-date cached account.
     sqlx::raw_sql("ALTER TABLE venue_binance_account_fills RENAME TO fixture_history_fills; ALTER TABLE venue_binance_position_history RENAME TO fixture_history_positions")
         .execute(&fixture.pool).await?;
     let cached = store
         .load_owned_for_display(user, &request.credential_id, Some(&display))
-        .await?;
-    assert_eq!(cached, Some(display.clone()));
+        .await;
+    assert!(cached.is_err());
     let current = store
         .load_owned_current(user, &request.credential_id)
         .await?
@@ -170,6 +230,27 @@ async fn verify_history_budget(
     );
     sqlx::raw_sql("ALTER TABLE fixture_history_fills RENAME TO venue_binance_account_fills; ALTER TABLE fixture_history_positions RENAME TO venue_binance_position_history")
         .execute(&fixture.pool).await?;
+    let mut newer_display = expected.clone();
+    newer_display.observed_ms += 1;
+    newer_display.persisted_ms += 1;
+    newer_display.positions[0].quantity += rust_decimal::Decimal::ONE;
+    sqlx::query("UPDATE venue_binance_account_projections SET projection_json=jsonb_set(projection_json,'{display_projection}',$1,true) WHERE credential_id=$2")
+        .bind(serde_json::to_value(&newer_display)?)
+        .bind(&request.credential_id)
+        .execute(&fixture.pool)
+        .await?;
+    let displayed = store
+        .load_owned_for_display(user, &request.credential_id, Some(expected))
+        .await?
+        .ok_or("newer display facts missing")?;
+    assert_eq!(displayed.positions, newer_display.positions);
+    assert_eq!(displayed.observed_ms, newer_display.observed_ms);
+    let execution = store
+        .load_owned_current(user, &request.credential_id)
+        .await?
+        .ok_or("execution facts missing")?;
+    assert_eq!(execution.positions, expected.positions);
+    assert_eq!(execution.observed_ms, expected.observed_ms);
     Ok(())
 }
 

@@ -1,6 +1,51 @@
 use super::*;
+#[test]
+fn asset_clock_changes_without_claiming_new_order_or_fill_facts()
+-> Result<(), Box<dyn std::error::Error>> {
+    let old = projection()?;
+    let mut next = old.clone();
+    next.balance_observed_ms = Some(next.observed_ms);
+    let event = TerminalAccountStreamEvent::between(Some(&old), Some(&next));
+    let mut current = Some(old);
+    event.apply(&mut current)?;
+    assert_eq!(current, Some(next));
+    Ok(())
+}
 use crate::kol::*;
 use venue_domain::{OrderSide, PositionSide};
+
+#[test]
+fn shared_updates_preserve_old_readers_and_reject_without_replacing_baseline()
+-> Result<(), Box<dyn std::error::Error>> {
+    let original = std::sync::Arc::new(projection()?);
+    let mut next = (*original).clone();
+    next.observed_ms += 10;
+    next.persisted_ms += 10;
+    next.positions.clear();
+    let mut shared = Some(original.clone());
+    TerminalAccountStreamEvent::between(Some(&original), Some(&next)).apply_shared(&mut shared)?;
+    assert_eq!(shared.as_deref(), Some(&next));
+    assert!(!original.positions.is_empty());
+    let baseline = shared.clone();
+    let mut invalid = next.clone();
+    invalid.credential_id = "invalid".into();
+    assert!(
+        TerminalAccountStreamEvent::Snapshot(Some(invalid))
+            .apply_shared(&mut shared)
+            .is_err()
+    );
+    assert!(std::sync::Arc::ptr_eq(
+        shared.as_ref().ok_or("missing")?,
+        baseline.as_ref().ok_or("missing")?
+    ));
+    assert!(
+        TerminalAccountStreamEvent::between(Some(&original), Some(&next))
+            .apply_shared(&mut shared)
+            .is_err()
+    );
+    assert_eq!(shared, baseline);
+    Ok(())
+}
 
 #[test]
 fn unchanged_fields_are_absent_and_changed_fields_replace_only_their_surface()
@@ -46,6 +91,7 @@ fn projection() -> Result<TerminalAccountProjection, Box<dyn std::error::Error>>
         mark_price: Some(101.into()),
     };
     Ok(TerminalAccountProjection {
+        balance_observed_ms: None,
         schema_version: 1,
         credential_id: "00000000-0000-4000-8000-000000000001".into(),
         trading_account_id: "00000000-0000-4000-8000-000000000002".into(),

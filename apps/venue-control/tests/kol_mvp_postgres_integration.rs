@@ -1191,6 +1191,35 @@ async fn private_projection_is_subscribed_persisted_and_owner_scoped()
     assert_eq!(owned.private_generation, 3);
     assert_eq!(owned.fills.len(), 1);
     assert_eq!(owned.position_history.len(), 2);
+    let display_snapshot = projection_snapshot(
+        source.trading_account_id.clone(),
+        "BTC/USDT".parse()?,
+        140,
+        3,
+        "fills-3",
+        Decimal::new(4, 3),
+        Decimal::new(50_200, 0),
+        false,
+    )?;
+    assert!(
+        store
+            .persist_display(&source, &display_snapshot, 141)
+            .await?
+    );
+    let display_json: serde_json::Value = sqlx::query_scalar("SELECT projection_json->'display_projection' FROM venue_binance_account_projections WHERE credential_id=$1")
+        .bind(&credential)
+        .fetch_one(&fixture.pool)
+        .await?;
+    let display: venue_control_protocol::kol::TerminalAccountProjection =
+        serde_json::from_value(display_json)?;
+    assert!(display.observed_ms > owned.observed_ms);
+    assert_ne!(display.positions, owned.positions);
+    let execution = store
+        .load_owned(&user, &credential)
+        .await?
+        .ok_or("missing execution projection")?;
+    assert_eq!(execution.positions, owned.positions);
+    assert_eq!(execution.observed_ms, owned.observed_ms);
     assert!(store.load_owned(&other, &credential).await?.is_none());
     fixture.cleanup().await?;
     Ok(())

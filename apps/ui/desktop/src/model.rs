@@ -83,6 +83,7 @@ pub struct MarketQuote {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MarketInstrument {
     pub symbol: String,
+    pub price_tick: Option<Decimal>,
     pub price_scale: u32,
     pub quantity_scale: u32,
 }
@@ -135,6 +136,8 @@ pub struct Preferences {
     pub favorite_symbols: Vec<String>,
     pub chart: crate::chart_settings::ChartDisplaySettings,
     pub chart_overrides: BTreeMap<String, crate::chart_settings::ChartDisplaySettings>,
+    pub analysis_anchors: Vec<crate::chart_view::analysis::AvwapAnchor>,
+    pub fixed_profile_ranges: Vec<crate::chart_view::analysis::FixedProfileRange>,
     pub chart_alerts: crate::chart_trading::AlertBook,
     pub trading: crate::trading::TradingSettings,
 }
@@ -155,6 +158,8 @@ impl Default for Preferences {
             favorite_symbols: vec![DEFAULT_SELECTED_SYMBOL.to_owned()],
             chart: crate::chart_settings::ChartDisplaySettings::default(),
             chart_overrides: BTreeMap::new(),
+            analysis_anchors: Vec::new(),
+            fixed_profile_ranges: Vec::new(),
             chart_alerts: crate::chart_trading::AlertBook::default(),
             trading: crate::trading::TradingSettings::default(),
         }
@@ -384,9 +389,13 @@ pub struct AppModel {
     #[cfg(not(target_arch = "wasm32"))]
     pub history_requests: Vec<crate::market::HistoryRequest>,
     #[cfg(not(target_arch = "wasm32"))]
+    pub shared_history_requests: Vec<crate::market::SharedHistoryRequest>,
+    #[cfg(not(target_arch = "wasm32"))]
     pub local_symbols: Vec<String>,
     #[cfg(not(target_arch = "wasm32"))]
     pub local_precisions: BTreeMap<String, (u32, u32)>,
+    #[cfg(not(target_arch = "wasm32"))]
+    pub local_price_ticks: BTreeMap<String, Decimal>,
     #[cfg(not(target_arch = "wasm32"))]
     pub local_catalog_error: Option<String>,
     #[cfg(not(target_arch = "wasm32"))]
@@ -421,6 +430,9 @@ impl AppModel {
         }
         preferences.favorite_symbols = symbol_tabs;
         preferences.trading.normalize_price_validity();
+        preferences.trading.normalize_manual_quote_amount();
+        let mut trade_dock = crate::trading::TradeDockState::default();
+        trade_dock.amount_input = preferences.trading.manual_quote_amount.clone();
         preferences
             .chart_overrides
             .retain(|_, settings| settings.validate().is_ok());
@@ -463,9 +475,13 @@ impl AppModel {
             #[cfg(not(target_arch = "wasm32"))]
             history_requests: Vec::new(),
             #[cfg(not(target_arch = "wasm32"))]
+            shared_history_requests: Vec::new(),
+            #[cfg(not(target_arch = "wasm32"))]
             local_symbols: Vec::new(),
             #[cfg(not(target_arch = "wasm32"))]
             local_precisions: BTreeMap::new(),
+            #[cfg(not(target_arch = "wasm32"))]
+            local_price_ticks: BTreeMap::new(),
             #[cfg(not(target_arch = "wasm32"))]
             local_catalog_error: None,
             #[cfg(not(target_arch = "wasm32"))]
@@ -480,13 +496,22 @@ impl AppModel {
             general_settings_requested: false,
             indicator_target: None,
             trading_settings_requested: false,
-            trade_dock: crate::trading::TradeDockState::default(),
+            trade_dock,
             request_sequence: 0,
         }
     }
 
     #[cfg(not(target_arch = "wasm32"))]
     pub fn apply_local_catalog(&mut self, instruments: Vec<MarketInstrument>) {
+        self.local_price_ticks = instruments
+            .iter()
+            .filter_map(|instrument| {
+                instrument
+                    .price_tick
+                    .filter(|tick| *tick > Decimal::ZERO)
+                    .map(|tick| (instrument.symbol.clone(), tick))
+            })
+            .collect();
         self.local_precisions = instruments
             .iter()
             .map(|instrument| {
@@ -523,36 +548,42 @@ impl AppModel {
         }
     }
 
-    pub fn format_market_price(&self, _symbol: &str, value: Decimal) -> String {
-        #[cfg(all(target_arch = "wasm32", feature = "preview"))]
-        if let Some(series) = self.browser_market.series(_symbol, None) {
-            return format_decimal(value, series.price_scale);
-        }
-        #[cfg(not(target_arch = "wasm32"))]
-        if let Some((scale, _)) = self.local_precisions.get(_symbol) {
-            return format_decimal(value, *scale as usize);
-        }
-        format_decimal(value, 8)
+    pub fn format_market_price(&self, symbol: &str, value: Decimal) -> String {
+        format_decimal(value, self.market_scales(symbol).0)
     }
 
-    pub fn format_market_quantity(&self, _symbol: &str, value: Decimal) -> String {
-        #[cfg(all(target_arch = "wasm32", feature = "preview"))]
-        if let Some(series) = self.browser_market.series(_symbol, None) {
-            return format_decimal(value, series.quantity_scale);
-        }
-        #[cfg(not(target_arch = "wasm32"))]
-        if let Some((_, scale)) = self.local_precisions.get(_symbol) {
-            return format_decimal(value, *scale as usize);
-        }
-        format_decimal(value, 8)
+    pub fn format_market_quantity(&self, symbol: &str, value: Decimal) -> String {
+        format_decimal(value, self.market_scales(symbol).1)
     }
 
-    #[cfg(not(target_arch = "wasm32"))]
+    pub fn market_price_tick(&self, symbol: &str) -> Option<Decimal> {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            self.local_price_ticks.get(symbol).copied()
+        }
+        #[cfg(all(target_arch = "wasm32", feature = "preview"))]
+        {
+            self.browser_market
+                .series(symbol, None)
+                .and_then(|series| series.price_tick)
+        }
+        #[cfg(all(target_arch = "wasm32", not(feature = "preview")))]
+        {
+            let _ = symbol;
+            None
+        }
+    }
+
     pub fn market_scales(&self, symbol: &str) -> (usize, usize) {
+        #[cfg(all(target_arch = "wasm32", feature = "preview"))]
+        if let Some(series) = self.browser_market.series(symbol, None) {
+            return (series.price_scale, series.quantity_scale);
+        }
         #[cfg(not(target_arch = "wasm32"))]
         if let Some((price, quantity)) = self.local_precisions.get(symbol) {
             return (*price as usize, *quantity as usize);
         }
+        let _ = symbol;
         (8, 8)
     }
 
@@ -782,8 +813,18 @@ impl AppModel {
                 instance_id: strategy.instance_id,
                 config_epoch: strategy.config_epoch,
             });
-        self.trade_dock
+        let changed = self
+            .trade_dock
             .observe_scope(&self.preferences.selected_symbol, scope);
+        if changed && !self.trade_dock.amount_in_base {
+            self.trade_dock.amount_input = self.preferences.trading.manual_quote_amount.clone();
+        }
+    }
+
+    pub fn remember_manual_quote_amount(&mut self) {
+        if !self.trade_dock.amount_in_base {
+            self.preferences.trading.manual_quote_amount = self.trade_dock.amount_input.clone();
+        }
     }
 
     pub fn refresh_trading_price(&mut self, context: &egui::Context) {
@@ -962,6 +1003,7 @@ impl AppModel {
         {
             self.local_symbols.clear();
             self.local_precisions.clear();
+            self.local_price_ticks.clear();
             self.history_requests.clear();
             self.local_catalog_error = None;
             if let Err(e) = self.local_markets.replace([]) {
@@ -1030,6 +1072,27 @@ mod tests {
             preferences.favorite_symbols,
             vec![DEFAULT_SELECTED_SYMBOL.to_owned()]
         );
+    }
+
+    #[test]
+    fn local_usd_amount_survives_restart_and_symbol_switch_without_carrying_base_size()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut preferences = Preferences::default();
+        preferences.trading.manual_quote_amount = "125.50".into();
+        let saved = serde_json::to_string(&preferences)?;
+        let mut model = AppModel::new(serde_json::from_str(&saved)?);
+        assert_eq!(model.trade_dock.amount_input, "125.50");
+        model.select_symbol("ETH/USDC".into());
+        assert_eq!(model.trade_dock.amount_input, "125.50");
+        model.trade_dock.amount_in_base = true;
+        model.trade_dock.amount_input = "3".into();
+        model.select_symbol("BTC/USDC".into());
+        assert!(!model.trade_dock.amount_in_base);
+        assert_eq!(model.trade_dock.amount_input, "125.50");
+        model.trade_dock.amount_input = "250".into();
+        model.remember_manual_quote_amount();
+        assert_eq!(model.preferences.trading.manual_quote_amount, "250");
+        Ok(())
     }
 
     #[test]
@@ -1256,6 +1319,7 @@ mod tests {
         model.apply_local_catalog(
             ["XRP/USDT", "BNB/USDC", "BTC/USDC", "ETH/USDC", "SOL/USDC"]
                 .map(|symbol| super::MarketInstrument {
+                    price_tick: None,
                     symbol: symbol.to_owned(),
                     price_scale: 2,
                     quantity_scale: 3,
@@ -1274,11 +1338,17 @@ mod tests {
     fn exchange_precision_is_used_with_trailing_zeroes() {
         let mut model = AppModel::new(Preferences::default());
         model.apply_local_catalog(vec![super::MarketInstrument {
+            price_tick: Some(Decimal::new(5, 2)),
             symbol: "SOL/USDC".to_owned(),
             price_scale: 5,
             quantity_scale: 3,
         }]);
 
+        assert_eq!(
+            model.market_price_tick("SOL/USDC"),
+            Some(Decimal::new(5, 2))
+        );
+        assert_eq!(model.market_price_tick("UNKNOWN/USDC"), None);
         assert_eq!(
             model.format_market_price("SOL/USDC", Decimal::new(104_900, 3)),
             "104.90000"

@@ -8,7 +8,7 @@ $repo = Split-Path -Parent $PSScriptRoot
 . (Join-Path $PSScriptRoot 'venue_build_guard.ps1')
 $plan = Get-VenueBuildPlan -RepoRoot $repo
 $admission = Test-VenueBuildAdmission $plan
-if ($admission.CacheBytes -gt 200GB) { throw 'Web preview build requires the 200 GiB cache admission budget.' }
+if ($admission.CacheBytes -gt $admission.BudgetBytes) { throw 'Web preview build exceeds the configured cache admission budget.' }
 if (-not (Test-Path -LiteralPath $WasmBindgen -PathType Leaf)) {
     throw 'Provide wasm-bindgen 0.2.126 from the official release matching Cargo.lock.'
 }

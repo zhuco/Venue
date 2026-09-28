@@ -60,6 +60,8 @@ MARKET_REST_PATHS = [
     "/fapi/v1/exchangeInfo",
     "/fapi/v1/ticker/24hr",
     "/fapi/v1/klines",
+    "/fapi/v1/openInterest",
+    "/futures/data/openInterestHist",
 ]
 MARKET_STREAM_PATHS = [
     "/market/stream",
@@ -143,13 +145,14 @@ def desired_routes():
 def multi_market_routes():
     sources = {
         "bybit": ("api.bybit.com", ["/v5/market/" + path for path in
-            ["time", "instruments-info", "tickers", "kline", "orderbook", "recent-trade"]]),
+            ["time", "instruments-info", "tickers", "kline", "orderbook", "recent-trade", "open-interest"]]),
         "bitget": ("api.bitget.com", ["/api/v3/market/" + path for path in
             ["instruments", "tickers", "candles", "orderbook", "fills"]]),
-        "okx": ("www.okx.com", ["/api/v5/public/instruments"] +
+        "okx": ("www.okx.com", ["/api/v5/public/instruments", "/api/v5/public/funding-rate", "/api/v5/public/open-interest",
+            "/api/v5/rubik/stat/contracts/open-interest-history"] +
             ["/api/v5/market/" + path for path in ["tickers", "candles", "history-candles", "books", "trades"]]),
         "gate": ("api.gateio.ws", ["/api/v4/futures/usdt/" + path for path in
-            ["contracts", "tickers", "candlesticks", "order_book", "trades"]]),
+            ["contracts", "contract_stats", "tickers", "candlesticks", "order_book", "trades"]]),
         "hyperliquid": ("api.hyperliquid.xyz", ["/info"]),
     }
     result = []

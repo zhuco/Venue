@@ -39,10 +39,28 @@ impl AccountService {
             .map(|snapshot| snapshot.binding().symbol.clone())
             .or_else(|| request.symbols.first().cloned())
             .ok_or(error(Code::InvalidInput))?;
-        let snapshot = StrategyCredentialStore::new_shared(self.pool.clone(), self.cipher.clone())
-            .snapshot(&principal.user.user_id, &credential.credential_id, symbol)
-            .await
-            .map_err(|_| error(Code::Unavailable))?;
+        let store = StrategyCredentialStore::new_shared(self.pool.clone(), self.cipher.clone());
+        let owner = principal.user.user_id.clone();
+        let credential_id = credential.credential_id.clone();
+        // UI symbol ordering does not create another account reader. Verification changes
+        // invalidate reuse, and authentication/ownership were checked by the caller.
+        let key = format!(
+            "{owner}/{credential_id}/{:?}/{:?}/{:?}/{:?}/{}/{symbol}",
+            credential.trading_account_id,
+            credential.verified_ms,
+            credential.verification,
+            credential.expires_ms,
+            credential.api_reachable
+        );
+        let snapshot = self
+            .projection_reads
+            .read(key, async move {
+                store
+                    .snapshot(&owner, &credential_id, symbol)
+                    .await
+                    .map_err(|_| error(Code::Unavailable))
+            })
+            .await?;
         if snapshot.binding().venue != credential.venue
             || credential.trading_account_id.as_deref()
                 != Some(snapshot.binding().trading_account_id.as_str())
@@ -64,6 +82,9 @@ impl AccountService {
                 .as_millis(),
         )
         .map_err(|_| error(Code::Unavailable))?;
-        project(&source, &snapshot, received_ms).map_err(|_| error(Code::Unavailable))
+        let mut projection =
+            project(&source, &snapshot, received_ms).map_err(|_| error(Code::Unavailable))?;
+        projection.balance_observed_ms = Some(snapshot.balance_observed_at_ms());
+        Ok(projection)
     }
 }

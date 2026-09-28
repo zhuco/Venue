@@ -9,7 +9,7 @@ async fn delayed_receipts_allow_four_openings_but_fence_close_and_shutdown() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let endpoint = format!("http://{}", listener.local_addr().unwrap());
         let (orders, order_rx) = crossbeam_channel::unbounded();
-        let (_cancels, cancel_rx) = crossbeam_channel::unbounded();
+        let (cancels, cancel_rx) = crossbeam_channel::bounded(16);
         let (_positions, position_rx) = crossbeam_channel::unbounded();
         let (events, received) = crossbeam_channel::unbounded();
         let wake = std::sync::Arc::new(tokio::sync::Notify::new());
@@ -40,6 +40,17 @@ async fn delayed_receipts_allow_four_openings_but_fence_close_and_shutdown() {
         }
         send(104, TerminalAction::CloseLong);
         assert!(tokio::time::timeout(std::time::Duration::from_millis(75), listener.accept()).await.is_err());
+        cancels.send(Scoped { scope: scope.clone(), value: TerminalCancelRequest {
+            schema_version: venue_control_protocol::kol::TERMINAL_SCHEMA_VERSION,
+            request_id: id(105), credential_id: scope.credential_id.clone(),
+            symbol: "BTC/USDC".parse().unwrap(), native_order_id: "existing-order".into(),
+            replacement_price: None,
+        }}).unwrap();
+        let (mut cancel, _) = listener.accept().await.unwrap();
+        let mut bytes = [0; 8192];
+        let size = cancel.read(&mut bytes).await.unwrap();
+        assert!(String::from_utf8_lossy(&bytes[..size]).contains(KOL_TERMINAL_CANCEL_PATH));
+        cancel.write_all(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 24\r\nConnection: close\r\n\r\n{\"code\":\"invalid_input\"}").await.unwrap();
         for socket in &mut sockets {
             socket.write_all(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 24\r\nConnection: close\r\n\r\n{\"code\":\"invalid_input\"}").await.unwrap();
         }
@@ -50,7 +61,7 @@ async fn delayed_receipts_allow_four_openings_but_fence_close_and_shutdown() {
         stop.store(true, std::sync::atomic::Ordering::Release);
         close.write_all(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 24\r\nConnection: close\r\n\r\n{\"code\":\"invalid_input\"}").await.unwrap();
         tokio::task::spawn_blocking(move || {
-            for _ in 0..5 { received.recv_timeout(std::time::Duration::from_secs(1)).unwrap(); }
+            for _ in 0..6 { received.recv_timeout(std::time::Duration::from_secs(1)).unwrap(); }
         }).await.unwrap();
     }).await.unwrap();
 }

@@ -1,0 +1,149 @@
+// @version=2
+// AICoin 日内敏捷共振系统终极版 + TD9/TD13 + 日内POC（平滑趋势隧道红绿云优化版）
+
+log("--- 日内终极版脚本(平滑红绿趋势隧道)开始运行 ---");
+
+// ==================== 1. 参数设置 ====================
+currentSymbol = syminfo.ticker;
+currentMarket = syminfo.prefix;
+
+// RSI 参数
+rsiPeriod     = input(14, title="RSI 周期");
+rsiOverbought = input(75, title="RSI 超买线 (防追高)");
+rsiOversold   = input(25, title="RSI 超卖线 (防杀跌)");
+rsiMidline    = input(50, title="RSI 多空分界线");
+
+// MACD 日内敏捷参数
+fastLength   = input(8, title="MACD 快线周期");
+slowLength   = input(21, title="MACD 慢线周期");
+signalLength = input(5, title="MACD 信号线周期");
+
+// 结构突破参数 (唐奇安通道 10 周期)
+breakoutPeriod = input(10, title="结构突破搜寻周期");
+
+// POC 筹码分布参数
+pocLookback = input(48, title="POC 搜寻周期(K线数)");
+pocBuffer   = input(0.003, title="POC 缓冲区比例(0.003即0.3%)");
+
+// ==================== 2. 计算日内均线与钻石平滑趋势隧道 ====================
+// 信号系统使用的敏捷均线
+ema9   = ema(close, 9);
+ema21  = ema(close, 21);
+ema55  = ema(close, 55);
+ema200 = ema(close, 200);
+
+// 【视觉核心优化】：计算构成一号图舒展、宽阔效果的趋势隧道均线 (EMA30 与 EMA180)
+tunnelFast = ema(close, 30);
+tunnelSlow = ema(close, 180);
+
+// 基础信号均线绘制（使用偏细线型，把视觉焦点让给趋势隧道）
+plot(ema9,   title='EMA9(攻击线)',   color='#00E5FF', lineWidth=1); // 天蓝
+plot(ema200, title='EMA200(牛熊边界)', color='#B0BEC5', lineWidth=1); // 冰阶灰
+
+// 定义 AICoin 兼容的通用空值变量
+nullVal = tunnelFast * 0 / 0
+
+// 基于 30-180 隧道的平滑多空状态拆分逻辑
+isTunnelGreen = tunnelFast >= tunnelSlow;
+
+// 拆分多头段隧道（平滑绿云）
+fast_g = isTunnelGreen ? tunnelFast : nullVal;
+slow_g = isTunnelGreen ? tunnelSlow : nullVal;
+
+// 拆分空头段隧道（平滑红云）
+fast_r = not isTunnelGreen ? tunnelFast : nullVal;
+slow_r = not isTunnelGreen ? tunnelSlow : nullVal;
+
+// 1. 绘制多头平滑绿云及粗边界线（完全复刻一号图宽云效果）
+p_fast_g = plot(fast_g, title='趋势隧道快轨-多', color='#00E676', lineWidth=3);
+p_slow_g = plot(slow_g, title='趋势隧道慢轨-多', color='#00E676', lineWidth=4);
+fill(p_fast_g, p_slow_g, color='#00E676');
+
+// 2. 绘制空头平滑红云及粗边界线
+p_fast_r = plot(fast_r, title='趋势隧道快轨-空', color='#FF3D00', lineWidth=3);
+p_slow_r = plot(slow_r, title='趋势隧道慢轨-空', color='#FF3D00', lineWidth=4);
+fill(p_fast_r, p_slow_r, color='#FF3D00');
+
+// ==================== 3. 计算一目均衡表 ====================
+// 仅保留逻辑计算，不进行任何原生 plot 绘制，防止污染主图视觉
+[cl_val, bl_val, ls_val, lsa_val, lsb_val] = ichimoku(close, 9, 26, 52, 26);
+cloudTop    = max(lsa_val, lsb_val);
+cloudBottom = min(lsa_val, lsb_val);
+
+// ==================== 4. 计算内置 RSI 与 MACD ====================
+rsiVal = rsi(close, rsiPeriod);
+[dif, dea, m] = macd(close, fastLength, slowLength, signalLength, "EMA", "EMA");
+
+// ==================== 5. 计算高量 K 线 / 日内 POC 支撑阻力 ====================
+maxVol = highest(volume, pocLookback);
+isMaxVolBar = volume == maxVol;
+
+pocClose = valuewhen(isMaxVolBar, close, 0);
+pocHigh  = valuewhen(isMaxVolBar, high, 0);
+pocLow   = valuewhen(isMaxVolBar, low, 0);
+
+atPocSupport = (abs(low - pocLow) / pocLow <= pocBuffer) || (abs(low - pocClose) / pocClose <= pocBuffer);
+atPocResist  = (abs(high - pocHigh) / pocHigh <= pocBuffer) || (abs(high - pocClose) / pocClose <= pocBuffer);
+
+// ==================== 6. 计算狄马克序列 (TD Sequential: TD9 / TD13) ====================
+[td_val] = td(close);
+
+td9_buy   = td_val == 9;
+td9_sell  = td_val == -9;
+td13_buy  = td_val == 13;
+td13_sell = td_val == -13;
+
+td_any_buy  = td9_buy || td13_buy;
+td_any_sell = td9_sell || td13_sell;
+
+plotText(td9_buy,   title='TD9买入',  text='9',  refSeries=low,  bgColor='#1B5E20', color='#E0E0E0', fontSize=10, placement='bottom');
+plotText(td13_buy,  title='TD13买入', text='13', refSeries=low,  bgColor='#004D40', color='#FFFFFF', fontSize=10, placement='bottom');
+plotText(td9_sell,  title='TD9卖出',  text='9',  refSeries=high, bgColor='#B71C1C', color='#E0E0E0', fontSize=10, placement='top');
+plotText(td13_sell, title='TD13卖出', text='13', refSeries=high, bgColor='#880E4F', color='#FFFFFF', fontSize=10, placement='top');
+
+// ==================== 7. 多空核心逻辑 ====================
+highestClose = highest(close[1], breakoutPeriod);
+lowestClose  = lowest(close[1], breakoutPeriod);
+
+structureLong  = close > highestClose;
+structureShort = close < lowestClose;
+
+// 做多逻辑
+emaLong         = close > ema9 && ema9 > ema21;
+ichiLong        = close > cloudTop || cl_val > bl_val;
+trendLong       = emaLong && ichiLong;
+rsiLongFilter   = rsiVal > rsiMidline && rsiVal < rsiOverbought;
+macdLongFilter  = dif > dea && m > 0 && m > m[1];
+
+isLongSignal    = trendLong && rsiLongFilter && macdLongFilter && structureLong;
+
+// 做空逻辑
+emaShort        = close < ema9 && ema9 < ema21 && close < ema55;
+ichiShort       = close < cloudBottom || cl_val < bl_val;
+trendShort      = emaShort && ichiShort;
+rsiShortFilter  = rsiVal < rsiMidline && rsiVal > rsiOversold;
+macdShortFilter = dif < dea && m < 0 && m < m[1];
+
+isShortSignal   = trendShort && rsiShortFilter && macdShortFilter && structureShort;
+
+rawLong  = isLongSignal && not isLongSignal[1];
+rawShort = isShortSignal && not isShortSignal[1];
+
+// ==================== 8. 建仓共振系统 ====================
+isSuperLong  = rawLong && (atPocSupport || td_any_buy);
+isSuperShort = rawShort && (atPocResist || td_any_sell);
+
+isNormalLong  = rawLong && not isSuperLong;
+isNormalShort = rawShort && not isSuperShort;
+
+// ==================== 9. 图表标注与预警推送 ====================
+plotText(isNormalLong,  title='普通做多', text='多',   refSeries=low,  bgColor='#00E676', color='#000000', fontSize=12, placement='bottom');
+plotText(isSuperLong,   title='强共振做多', text='强多', refSeries=low,  bgColor='#00C853', color='#FFFFFF', fontSize=13, placement='bottom');
+
+plotText(isNormalShort, title='普通做空', text='空',   refSeries=high, bgColor='#FF5252', color='#FFFFFF', fontSize=12, placement='top');
+plotText(isSuperShort,  title='强共振做空', text='强空', refSeries=high, bgColor='#D50000', color='#FFFFFF', fontSize=13, placement='top');
+
+alertcondition(rawLong,      title='【日内做多】', direction='buy');
+alertcondition(rawShort,     title='【日内做空】', direction='sell');
+alertcondition(isSuperLong,  title='【强共振建仓做多】', direction='buy');
+alertcondition(isSuperShort, title='【强共振建仓做空】', direction='sell');
